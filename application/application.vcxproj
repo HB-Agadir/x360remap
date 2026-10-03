@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Release Retail|Xbox 360">
@@ -14,7 +14,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
     <!-- Standalone launchable .xex, NOT a DashLaunch plugin - this is the
-         difference from hiddriver.vcxproj (ConfigurationType=DynamicLibrary,
+         difference from X360Remap.vcxproj (ConfigurationType=DynamicLibrary,
          /dll link flag, <sysdll/> in xex.xml). See ARCHITECTURE.md. -->
     <ConfigurationType>Application</ConfigurationType>
   </PropertyGroup>
@@ -41,7 +41,7 @@
          des fichiers qui n'ont rien a voir avec XexUtils. main.cpp inclut
          desormais Input.h/Xam.h par chemin relatif explicite
          (..\XexUtils\src\Input.h), qui n'a pas ce probleme (voir main.cpp). -->
-    <IncludePath>..\hiddriver\xkelib;..\hiddriver;.\;$(IncludePath)</IncludePath>
+    <IncludePath>..\X360Remap\xkelib;..\X360Remap;.\;$(IncludePath)</IncludePath>
     <LinkIncremental>false</LinkIncremental>
     <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
     <RemoteRoot>HDD:\X360RemapStudio\</RemoteRoot>
@@ -50,7 +50,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\hiddriver\xkelib;..\hiddriver;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>..\X360Remap\xkelib;..\X360Remap;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
       <Optimization>Full</Optimization>
@@ -68,9 +68,9 @@
       <WholeProgramOptimization>true</WholeProgramOptimization>
     </ClCompile>
     <Link>
-      <AdditionalLibraryDirectories>..\hiddriver\xkelib</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>..\X360Remap\xkelib</AdditionalLibraryDirectories>
       <!-- xkelib.lib retire d'ici le 2026-08-01 (etait copie du pattern
-           hiddriver.vcxproj, qui EN A besoin car hiddriver.xex est un plugin
+           X360Remap.vcxproj, qui EN A besoin car X360Remap.xex est un plugin
            DashLaunch qui hooke le D3D9 du xam.xex DEJA EN COURS D'EXECUTION -
            application.xex n'est pas dans ce cas, c'est un .xex autonome qui
            cree son propre device D3D9 independant). Cause reelle d'une
@@ -120,13 +120,25 @@
     <ClInclude Include="theme.h" />
     <ClInclude Include="font_data_inter.h" />
     <ClInclude Include="donation_links.h" />
-    <ClInclude Include="..\hiddriver\mapping.h" />
-    <ClInclude Include="..\hiddriver\mapping_assistant.h" />
-    <ClInclude Include="..\hiddriver\known_titles.h" />
-    <ClInclude Include="..\hiddriver\known_devices.h" />
-    <ClInclude Include="..\hiddriver\mouse_calibration.h" />
+    <ClInclude Include="texture_loader.h" />
+    <ClInclude Include="ui_assets.h" />
+    <ClInclude Include="ui_layout.h" />
+    <ClInclude Include="ui_mapping.h" />
+    <ClInclude Include="ui_glossy.h" />
+    <ClInclude Include="aurora_library.h" />
+    <ClInclude Include="glossy_assets.h" />
+    <ClInclude Include="glossy_layout.h" />
+    <ClInclude Include="font_data_barlow.h" />
+    <ClInclude Include="image_data_manette.h" />
+    <ClInclude Include="image_data_souris.h" />
+    <ClInclude Include="image_data_qrcode.h" />
+    <ClInclude Include="..\X360Remap\mapping.h" />
+    <ClInclude Include="..\X360Remap\mapping_assistant.h" />
+    <ClInclude Include="..\X360Remap\known_titles.h" />
+    <ClInclude Include="..\X360Remap\known_devices.h" />
+    <ClInclude Include="..\X360Remap\mouse_calibration.h" />
     <ClInclude Include="calibration_session.h" />
-    <ClInclude Include="..\hiddriver\usb.h" />
+    <ClInclude Include="..\X360Remap\usb.h" />
     <ClInclude Include="third_party\imgui\imgui_impl_dx9_xenon.h" />
     <ClInclude Include="third_party\imgui\imgui.h" />
     <ClInclude Include="third_party\imgui\imgui_internal.h" />
@@ -138,7 +150,7 @@
          utilisateur. Inclus directement par imgui_impl_dx9_xenon.cpp. -->
     <ClInclude Include="third_party\imgui\shaders\imgui_vs.h" />
     <ClInclude Include="third_party\imgui\shaders\imgui_ps.h" />
-    <!-- XexUtils (vendorise dans hiddriver360-master\XexUtils\, voir
+    <!-- XexUtils (vendorise dans XexUtils\, voir
          ARCHITECTURE.md section "XexUtils"). Seuls les headers reellement
          inclus depuis main.cpp sont listes ici. -->
     <ClInclude Include="..\XexUtils\src\Input.h" />
@@ -146,7 +158,7 @@
     <!-- Filesystem.h/.cpp ajoutes le 2026-08-01 (voir PROJECT_NOTES.md,
          "HDD: introuvable depuis application.xex") : XexUtils::Fs::MountHdd()
          est necessaire AVANT tout acces a "HDD:\..." depuis ce binaire -
-         contrairement a hiddriver.xex (plugin DashLaunch, tourne DANS le
+         contrairement a X360Remap.xex (plugin DashLaunch, tourne DANS le
          processus xam.xex du dashboard, qui a deja "hdd:" mappe en tant que
          lien symbolique SYSTEME), application.xex est un titre lance de
          maniere independante, avec son propre namespace d'objets prive - il
@@ -164,6 +176,18 @@
     <ClCompile Include="theme.cpp" />
     <ClCompile Include="font_data_inter.cpp" />
     <ClCompile Include="donation_links.cpp" />
+    <ClCompile Include="stb_image_impl.cpp" />
+    <ClCompile Include="texture_loader.cpp" />
+    <ClCompile Include="ui_assets.cpp" />
+    <ClCompile Include="ui_layout.cpp" />
+    <ClCompile Include="ui_mapping.cpp" />
+    <ClCompile Include="ui_glossy.cpp" />
+    <ClCompile Include="aurora_library.cpp" />
+    <ClCompile Include="glossy_assets.cpp" />
+    <ClCompile Include="font_data_barlow.cpp" />
+    <ClCompile Include="image_data_manette.cpp" />
+    <ClCompile Include="image_data_souris.cpp" />
+    <ClCompile Include="image_data_qrcode.cpp" />
     <ClCompile Include="third_party\imgui\imgui_impl_dx9_xenon.cpp" />
     <!-- Coeur Dear ImGui v1.72b (retrograde depuis v1.90.9 le 2026-08-01,
          voir ARCHITECTURE.md "Rendu : Dear ImGui" et
@@ -181,19 +205,19 @@
          PAS utilise, retire de la compilation. Le fichier lui-meme n'a pas
          pu etre supprime du disque (meme limitation git deja documentee
          dans PROJECT_NOTES.md), laisse en place mais inerte. -->
-    <ClCompile Include="..\hiddriver\mapping.cpp">
+    <ClCompile Include="..\X360Remap\mapping.cpp">
       <ObjectFileName>$(IntDir)mapping_app.obj</ObjectFileName>
     </ClCompile>
-    <ClCompile Include="..\hiddriver\mapping_assistant.cpp">
+    <ClCompile Include="..\X360Remap\mapping_assistant.cpp">
       <ObjectFileName>$(IntDir)mapping_assistant_app.obj</ObjectFileName>
     </ClCompile>
-    <ClCompile Include="..\hiddriver\known_titles.cpp">
+    <ClCompile Include="..\X360Remap\known_titles.cpp">
       <ObjectFileName>$(IntDir)known_titles_app.obj</ObjectFileName>
     </ClCompile>
-    <ClCompile Include="..\hiddriver\mouse_calibration.cpp">
+    <ClCompile Include="..\X360Remap\mouse_calibration.cpp">
       <ObjectFileName>$(IntDir)mouse_calibration_app.obj</ObjectFileName>
     </ClCompile>
-    <ClCompile Include="..\hiddriver\known_devices.cpp">
+    <ClCompile Include="..\X360Remap\known_devices.cpp">
       <ObjectFileName>$(IntDir)known_devices_app.obj</ObjectFileName>
     </ClCompile>
     <!-- XexUtils - compile directement les .cpp necessaires plutot qu'une

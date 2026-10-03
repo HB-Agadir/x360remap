@@ -75,3 +75,57 @@ void ApplyX360RemapTheme();
 // fois la mise en page de la maquette 2 en place et les besoins de
 // hierarchie (titres vs texte courant) plus clairs.
 void LoadX360RemapFont(float pixelSize);
+
+// Construit l'atlas et verifie qu'un echantillon de caracteres accentues
+// existe bien a chacune des quatre tailles chargees. Appelee automatiquement
+// par LoadX360RemapFont() - exposee surtout pour la clarte.
+void BuildFontAtlasReport();
+
+// Resultat de cette verification, sous forme lisible, a ecrire dans le
+// journal de l'application. ImGui ne signale jamais un glyphe qu'il n'a pas
+// reussi a ranger dans son atlas (voir le commentaire dans theme.cpp) : sans
+// cette trace, un rendu casse ne se constate qu'a l'oeil, sur une chaine
+// precise, dans un panneau precis. Un "manquants : 0" partout confirme que
+// l'atlas est sain ; tout autre chiffre designe la taille fautive.
+const char* GetFontAtlasReport();
+
+// --- Hierarchie typographique (2026-08-14) ---------------------------------
+// Quatre tailles issues du meme fichier Inter, remplies par
+// LoadX360RemapFont(). Elles existent parce que la maquette repose sur une
+// hierarchie : avec une seule taille, la mise en page est correcte mais le
+// rendu reste plat.
+//
+//   g_fontBody  : texte courant. C'est la police PAR DEFAUT (chargee en
+//                 premier), donc tout code qui n'appelle pas PushX360Font
+//                 l'utilise sans rien changer.
+//   g_fontSmall : libelles compacts, titres de section en capitales, valeurs
+//                 secondaires (VID:PID, sous-titres).
+//   g_fontTitle : titres de panneau, noms de jeu.
+//   g_fontLogo  : le logo "X360 REMAP" de la barre superieure, uniquement.
+//
+// Peuvent valoir nullptr si le chargement de police a echoue et qu'on est
+// retombe sur la police par defaut d'ImGui - d'ou PushX360Font/PopX360Font,
+// qui tolerent ce cas.
+extern ImFont* g_fontBody;
+extern ImFont* g_fontSmall;
+extern ImFont* g_fontTitle;
+extern ImFont* g_fontLogo;
+
+// Polices de la page "glossy" (Barlow Condensed, 2026-09-24 - voir
+// ui_glossy.cpp). Tailles en pixels ImGui, c'est-a-dire hauteur
+// ascendante+descendante : 1,2 x la taille "em" des maquettes (PIL/CSS).
+// nullptr si le chargement a echoue : ui_glossy.cpp retombe alors sur la
+// police courante.
+extern ImFont* g_fontGBody;    // Barlow 400, 24 px - texte courant
+extern ImFont* g_fontGBodyM;   // Barlow 500, 24 px - valeurs, onglet actif
+extern ImFont* g_fontGLarge;   // Barlow 400, 26 px - boutons, onglets
+extern ImFont* g_fontGTitle;   // Barlow 400, 37 px - titres de colonne
+extern ImFont* g_fontGSmall;   // Barlow 400, 20 px - bornes, DPI
+extern ImFont* g_fontGCaps;    // Barlow 500, 18 px - libelles en capitales
+
+// A utiliser par PAIRES, avec le MEME pointeur des deux cotes :
+//   PushX360Font(g_fontSmall);  ...  PopX360Font(g_fontSmall);
+// Passer nullptr ne fait rien (ni push, ni pop), ce qui evite a chaque
+// appelant de verifier lui-meme que la police existe.
+void PushX360Font(ImFont* font);
+void PopX360Font(ImFont* font);

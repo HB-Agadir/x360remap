@@ -1,5 +1,7 @@
 #include "theme.h"
 #include "font_data_inter.h"
+#include "font_data_barlow.h"
+#include <cstdio>   // _snprintf, pour le rapport d'atlas de police
 
 // Conversion hex -> ImVec4, alpha 1.0 par defaut - juste pour ecrire la
 // palette de ETAT_DU_PROJET.md telle quelle (#0A0A0C etc) au lieu de la
@@ -166,15 +168,185 @@ void LoadX360RemapFont(float pixelSize) {
     ImFontConfig fontConfig;
     fontConfig.FontDataOwnedByAtlas = false;
 
-    ImFont* font = io.Fonts->AddFontFromMemoryTTF(
+    // --- Correctif du rendu casse des accents (2026-09-13) ---
+    //
+    // SYMPTOME : un meme mot accentue ("configuracoes" en portugais,
+    // "configuracion" en espagnol) s'affiche correctement dans un panneau et
+    // en "?" dans un autre. Pas un probleme de caractere ni de police : le
+    // .ttf embarque contient bien tous les glyphes, et le texte source decode
+    // proprement en UTF-8 (verifie caractere par caractere). C'est un
+    // probleme propre a CERTAINES TAILLES de police (suivi interne)
+    // section 5.2.
+    //
+    // CAUSE : ImGui range tous les glyphes de toutes les tailles dans UN SEUL
+    // atlas, et son propre code porte le commentaire "FIXME: We are not
+    // handling packing failure here" - un glyphe qui ne rentre pas n'est pas
+    // signale, il reste simplement corrompu. Avec quatre tailles chargees et
+    // ~350 glyphes chacune, l'atlas deborde silencieusement.
+    //
+    // DEUX LEVIERS, appliques ensemble :
+    //
+    // 1. Sur-echantillonnage ramene a 1. Par defaut ImGui rasterise chaque
+    //    glyphe TROIS FOIS plus large (OversampleH = 3) pour un
+    //    positionnement sous-pixel plus fin. Sur un ecran de television, a
+    //    ces tailles, le gain est invisible ; le cout, lui, est un atlas trois
+    //    fois plus large. C'est le levier le plus efficace.
+    //
+    // 2. Largeur d'atlas forcee a 2048 au lieu de l'heuristique automatique
+    //    d'ImGui (qui choisit 512/1024/2048 selon une estimation de surface -
+    //    estimation qui, visiblement, se trompait ici). Plus l'atlas est
+    //    large, moins il est haut : la texture reste petite en memoire.
+    fontConfig.OversampleH = 1;
+    fontConfig.OversampleV = 1;
+    io.Fonts->TexDesiredWidth = 2048;
+
+    // QUATRE TAILLES (2026-08-14). La maquette repose sur une hierarchie
+    // typographique : logo, titres de section en petites capitales espacees,
+    // texte courant, libelles compacts. Avec une seule taille, la structure
+    // serait correcte mais le rendu resterait plat - c'est la hierarchie qui
+    // fait qu'un ecran parait concu plutot qu'aligne.
+    //
+    // Le meme .ttf est charge plusieurs fois : ImGui rasterise un jeu de
+    // glyphes distinct par taille dans le meme atlas. Le cout est en surface
+    // d'atlas, pas en memoire de police (les octets du .ttf ne sont pas
+    // dupliques, seul le pointeur est reutilise).
+    //
+    // L'ORDRE COMPTE : la premiere police ajoutee devient la police par
+    // defaut. On charge donc `pixelSize` (le texte courant) en premier, pour
+    // que tout le code existant qui n'appelle pas PushFont continue de
+    // s'afficher exactement comme avant.
+    g_fontBody = io.Fonts->AddFontFromMemoryTTF(
         (void*)kInterFont24ptRegularData, kInterFont24ptRegularSize,
         pixelSize, &fontConfig, s_glyphRanges);
+
+    g_fontSmall = io.Fonts->AddFontFromMemoryTTF(
+        (void*)kInterFont24ptRegularData, kInterFont24ptRegularSize,
+        pixelSize * 0.72f, &fontConfig, s_glyphRanges);
+
+    g_fontTitle = io.Fonts->AddFontFromMemoryTTF(
+        (void*)kInterFont24ptRegularData, kInterFont24ptRegularSize,
+        pixelSize * 1.30f, &fontConfig, s_glyphRanges);
+
+    g_fontLogo = io.Fonts->AddFontFromMemoryTTF(
+        (void*)kInterFont24ptRegularData, kInterFont24ptRegularSize,
+        pixelSize * 1.75f, &fontConfig, s_glyphRanges);
 
     // Repli de securite si jamais le chargement echoue quand meme (donnees
     // corrompues, atlas hors memoire...) - meme raisonnement que pour
     // l'ancienne version basee fichier : ne JAMAIS laisser l'atlas de
     // police vide, ca plante le rendu ImGui des la premiere frame.
-    if (!font) {
+    if (!g_fontBody) {
         io.Fonts->AddFontDefault();
+        // Les autres tailles restent nulles : PushX360Font() le teste et ne
+        // fait rien dans ce cas, plutot que d'empiler un pointeur invalide.
+        g_fontSmall = g_fontTitle = g_fontLogo = nullptr;
     }
+
+    // --- Page "glossy" : Barlow Condensed (2026-09-24) ---
+    // Ajoutees APRES Inter : la police par defaut (la premiere ajoutee) ne
+    // change pas, les autres pages s'affichent exactement comme avant.
+    // Sous-ensemble latin : Latin-1 (accents FR/PT/ES) + tirets + "...".
+    // Les fleches n'y sont pas : la page glossy les dessine en image.
+    {
+        static const ImWchar s_glossyRanges[] = {
+            0x0020, 0x00FF,
+            0x2013, 0x2014,   // tirets demi-cadratin / cadratin
+            0x2026, 0x2026,   // points de suspension
+            0x2039, 0x203A,   // chevrons simples (cases souris, pagination)
+            0,
+        };
+        ImFontConfig g;
+        g.FontDataOwnedByAtlas = false;   // tableau statique : voir plus haut
+        g.OversampleH = 1;
+        g.OversampleV = 1;
+        g_fontGBody  = io.Fonts->AddFontFromMemoryTTF((void*)kBarlowCond400Data, kBarlowCond400Size, 24.0f, &g, s_glossyRanges);
+        g_fontGBodyM = io.Fonts->AddFontFromMemoryTTF((void*)kBarlowCond500Data, kBarlowCond500Size, 24.0f, &g, s_glossyRanges);
+        g_fontGLarge = io.Fonts->AddFontFromMemoryTTF((void*)kBarlowCond400Data, kBarlowCond400Size, 26.0f, &g, s_glossyRanges);
+        g_fontGTitle = io.Fonts->AddFontFromMemoryTTF((void*)kBarlowCond400Data, kBarlowCond400Size, 37.0f, &g, s_glossyRanges);
+        g_fontGSmall = io.Fonts->AddFontFromMemoryTTF((void*)kBarlowCond400Data, kBarlowCond400Size, 20.0f, &g, s_glossyRanges);
+        g_fontGCaps  = io.Fonts->AddFontFromMemoryTTF((void*)kBarlowCond500Data, kBarlowCond500Size, 18.0f, &g, s_glossyRanges);
+    }
+
+    BuildFontAtlasReport();
+}
+
+// --- Verification de l'atlas apres construction (2026-09-13) ---------------
+//
+// ImGui ne signale JAMAIS un glyphe qu'il n'a pas reussi a ranger ("FIXME: We
+// are not handling packing failure here" dans son propre code). Le defaut ne
+// se voit donc qu'a l'oeil, sur une chaine precise, dans un panneau precis -
+// exactement ce qui a rendu ce bug si penible a cerner (signale le 2026-08-24
+// sur le portugais, retrouve le 2026-09-13 sur l'espagnol).
+//
+// On verifie donc nous-memes, une fois l'atlas construit, qu'un echantillon
+// de caracteres accentues existe bien A CHACUNE des quatre tailles. Le
+// resultat part dans le journal de l'application : si le probleme revient un
+// jour, il sera lisible dans un fichier plutot que devine sur une capture
+// d'ecran.
+static char s_fontReport[192] = "(rapport de police non genere)";
+
+static int CountMissingGlyphs(ImFont* f) {
+    if (!f) return -1;
+    // Echantillon couvrant les besoins reels des quatre langues :
+    // espagnol (a e i o u accentues, n tilde, point d'interrogation inverse),
+    // portugais (a/o tilde, c cedille), francais (e accent grave/aigu).
+    static const ImWchar kSample[] = {
+        0x00E1, 0x00E9, 0x00ED, 0x00F3, 0x00FA,  // a e i o u accent aigu
+        0x00F1, 0x00BF, 0x00A1,                  // n tilde, ? et ! inverses
+        0x00E3, 0x00F5, 0x00E7,                  // a/o tilde, c cedille
+        0x00E8, 0x00EA, 0x00E0,                  // e grave, e circonflexe, a grave
+        0x00D3, 0x00C9,                          // O et E majuscules accentues
+        0
+    };
+    int missing = 0;
+    for (int i = 0; kSample[i]; i++)
+        if (!f->FindGlyphNoFallback(kSample[i])) missing++;
+    return missing;
+}
+
+void BuildFontAtlasReport() {
+    ImGuiIO& io = ImGui::GetIO();
+
+    // L'atlas n'est construit qu'a la premiere demande de pixels (par le
+    // backend de rendu). On force la construction ici pour pouvoir verifier
+    // tout de suite ; le backend reutilisera le resultat, sans surcout.
+    io.Fonts->Build();
+
+    _snprintf(s_fontReport, sizeof(s_fontReport) - 1,
+              "Atlas police %dx%d - glyphes accentues manquants : body=%d small=%d title=%d logo=%d",
+              io.Fonts->TexWidth, io.Fonts->TexHeight,
+              CountMissingGlyphs(g_fontBody),  CountMissingGlyphs(g_fontSmall),
+              CountMissingGlyphs(g_fontTitle), CountMissingGlyphs(g_fontLogo));
+    s_fontReport[sizeof(s_fontReport) - 1] = '\0';
+}
+
+const char* GetFontAtlasReport() {
+    return s_fontReport;
+}
+
+// Definis ici plutot que dans l'en-tete : ce sont des variables, pas des
+// constantes, et elles ne doivent exister qu'en un seul exemplaire.
+ImFont* g_fontBody  = nullptr;
+ImFont* g_fontSmall = nullptr;
+ImFont* g_fontTitle = nullptr;
+ImFont* g_fontLogo  = nullptr;
+ImFont* g_fontGBody  = nullptr;
+ImFont* g_fontGBodyM = nullptr;
+ImFont* g_fontGLarge = nullptr;
+ImFont* g_fontGTitle = nullptr;
+ImFont* g_fontGSmall = nullptr;
+ImFont* g_fontGCaps  = nullptr;
+
+void PushX360Font(ImFont* font) {
+    // Tolerer nullptr simplifie tous les appelants : ils n'ont pas a verifier
+    // que la police existe avant chaque PushFont/PopFont. En contrepartie,
+    // PopX360Font doit recevoir le MEME pointeur pour savoir s'il y a
+    // reellement quelque chose a depiler.
+    if (font)
+        ImGui::PushFont(font);
+}
+
+void PopX360Font(ImFont* font) {
+    if (font)
+        ImGui::PopFont();
 }

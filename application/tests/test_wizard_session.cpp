@@ -1,7 +1,7 @@
 // Portable test harness for the application.xex side: input_state.json
 // reading + WizardSession + config_writer, compiled and run for real
 // against the actual mapping.cpp used in production - same spirit as
-// hiddriver/tests/test_mapping_assistant.cpp. Only main.cpp (the XUI screen
+// X360Remap/tests/test_mapping_assistant.cpp. Only main.cpp (the XUI screen
 // itself) is untested here, since it can't be compiled or run off-console -
 // see ARCHITECTURE.md.
 #include <cassert>
@@ -10,7 +10,7 @@
 #include <fstream>
 #include <string>
 
-#include "../../hiddriver/mapping.h"
+#include "../../X360Remap/mapping.h"
 #include "../config_writer.h"
 #include "../input_state_reader.h"
 #include "../wizard_session.h"
@@ -59,7 +59,7 @@ static void TestReadInputState() {
     CHECK(missing.mouseButton == -1);
 
     // Real payload shape written by plugin.xex since 2026-08-01 (cursor
-    // fields, see hiddriver/main.cpp) - mouseDX/mouseDY can be negative
+    // fields, see X360Remap/main.cpp) - mouseDX/mouseDY can be negative
     // (motion left/up), mouseButtons is a raw bitmask (bit0=left set here).
     const char* pathCursor = "/tmp/test_input_state_cursor.json";
     WriteFile(pathCursor, R"JSON({ "keyCode": -1, "mouseButton": 0, "mouseDX": -7, "mouseDY": 3, "mouseButtons": 1, "tick": 5000 })JSON");
@@ -79,7 +79,7 @@ static void TestReadInputState() {
 static void TestWizardSessionEndToEnd() {
     std::printf("TestWizardSessionEndToEnd\n");
 
-    const char* configPath = "/tmp/test_hiddriver_config.json";
+    const char* configPath = "/tmp/test_x360remap_config.json";
     std::remove(configPath); // start from a clean slate
 
     WizardSession wizard(1121, 16193, DefaultKeyboardWizardSteps());
@@ -138,7 +138,7 @@ static void TestWizardSessionEndToEnd() {
 static void TestWizardPreservesOtherDeviceEntries() {
     std::printf("TestWizardPreservesOtherDeviceEntries\n");
 
-    const char* configPath = "/tmp/test_hiddriver_config_multi.json";
+    const char* configPath = "/tmp/test_x360remap_config_multi.json";
     WriteFile(configPath, R"JSON(
 [
   { "vid": 1121, "pid": 20021, "mouseSensitivity": 10000,
@@ -344,7 +344,7 @@ static void TestApplyMouseButtonMapping() {
 }
 
 // idx 3/4 = convention "molette avant/arriere" (voir FindWheelOverride dans
-// hiddriver/main.cpp, cote Xbox uniquement donc non testable ici) - ce test
+// X360Remap/main.cpp, cote Xbox uniquement donc non testable ici) - ce test
 // verifie juste que config_writer/mapping.cpp acceptent et round-trippent
 // ces idx sans les traiter differemment de 0/1/2, puisque HidButtonMapEntry
 // ne fait aucune distinction particuliere entre les indices.
@@ -584,7 +584,7 @@ static void TestListKnownTitleIds() {
 // 2026-08-02 (suite Jalon 7) - retour utilisateur reel : le Title ID en hex
 // seul n'est pas assez lisible pour reconnaitre un jeu ("Tomb Raider"). Verifie
 // le meme cote application que TestSetMouseProfileCreatesAndUpdates cote
-// plugin (hiddriver/tests/test_mapping_assistant.cpp) : un nom fourni est
+// plugin (X360Remap/tests/test_mapping_assistant.cpp) : un nom fourni est
 // enregistre et relu, un appel ulterieur sans nom (gameName == nullptr) ne
 // l'efface pas.
 static void TestApplyMouseProfileGameName() {
@@ -617,15 +617,15 @@ static void TestApplyMouseProfileGameName() {
 }
 
 // Jalon 8 (application/ROADMAP_APPLICATION.md), corrige le 2026-08-03 -
-// ListKnownDevices() lit maintenant known_devices.txt (hiddriver/known_devices.h),
-// alimente par hiddriver.xex a la detection USB reelle - PAS une heuristique
+// ListKnownDevices() lit maintenant known_devices.txt (X360Remap/known_devices.h),
+// alimente par X360Remap.xex a la detection USB reelle - PAS une heuristique
 // sur ce qui a ete configure via cette appli (premiere version, abandonnee le
 // meme jour : ne listait rien pour un peripherique jamais touche par le
 // wizard/reglages souris, bloquant des le premier vrai test avec une 2e
 // souris - voir le commentaire de KnownDeviceInfo dans config_writer.h pour
 // l'historique complet). Ce test verifie donc juste la lecture du fichier,
 // pas de classification a testerici : la logique de parsing/serialisation
-// elle-meme est deja testee cote hiddriver (hiddriver/tests/test_mapping_assistant.cpp,
+// elle-meme est deja testee cote plugin (X360Remap/tests/test_mapping_assistant.cpp,
 // TestParseKnownDevicesBasic etc.) - une seule source de verite pour ce
 // format, pas de logique dupliquee entre les deux suites de tests.
 static void TestListKnownDevices() {

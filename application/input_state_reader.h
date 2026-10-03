@@ -10,8 +10,10 @@ struct InputStateSnapshot {
     // broncher, d'ou le fait que ce bug n'a ete detecte qu'au build reel.
     InputStateSnapshot()
         : keyCode(-1), mouseButton(-1), mouseDX(0), mouseDY(0),
-          mouseButtonsMask(0), wheelDelta(0), rawLen(0), tick(0), valid(false) {
+          mouseButtonsMask(0), wheelDelta(0), rawLen(0), tick(0), rawSeq(0), hasRawSeq(false), valid(false),
+          hasDevs(false), devCount(0) {
         for (int i = 0; i < 16; i++) raw[i] = 0;
+        for (int i = 0; i < 4; i++) { devType[i] = 0; devVid[i] = devPid[i] = 0; }
     }
 
     int32_t keyCode;      // HID keycode of the key currently held on the
@@ -23,7 +25,7 @@ struct InputStateSnapshot {
     // relative motion accumulated by plugin.xex since the last time it wrote
     // this file (its own dedicated accumulator, separate from the one that
     // feeds the right-stick emulation - see Controller::cursorAccumX in
-    // hiddriver/main.cpp) - NOT an absolute position, add to a running
+    // X360Remap/main.cpp) - NOT an absolute position, add to a running
     // on-screen cursor position every frame. mouseButtonsMask is the raw HID
     // button bitmask (bit0=left/bit1=right/bit2=middle...), 0 when nothing is
     // held or no mouse is connected - unlike mouseButton above, 0 is already
@@ -36,7 +38,7 @@ struct InputStateSnapshot {
     // demande utilisateur : pouvoir faire defiler l'interface a la molette
     // au lieu de cliquer sur des fleches). Meme principe que mouseDX/mouseDY
     // ci-dessus - propre accumulateur cote plugin (Controller::uiWheelAccum,
-    // hiddriver/main.cpp), drainé et remis a zero a chaque ecriture. Positif
+    // X360Remap/main.cpp), drainé et remis a zero a chaque ecriture. Positif
     // = molette vers l'avant. A ne pas confondre avec le champ "molette"
     // utilise pour le binding manette (mouseWheelAccum/bindWheelDir cote
     // plugin) - celui-ci est dedie au defilement de CETTE interface.
@@ -52,7 +54,21 @@ struct InputStateSnapshot {
     uint8_t raw[16];
     uint8_t rawLen;
 
+    // Peripheriques REELLEMENT branches (champ "devs", 2026-09-25) : 'k'
+    // clavier / 'm' souris + VID:PID. hasDevs = false avec un plugin plus
+    // ancien qui n'ecrit pas ce champ (on retombe alors sur l'ancien critere).
+    bool     hasDevs;
+    int      devCount;
+    char     devType[4];
+    uint16_t devVid[4];
+    uint16_t devPid[4];
+
     uint32_t tick;         // plugin.xex's GetTickCount() at write time
+    // Numero du dernier rapport souris recu par le plugin (2026-09-25). Change
+    // seulement quand un NOUVEAU rapport arrive, contrairement a tick.
+    // hasRawSeq == false : plugin plus ancien, champ absent.
+    uint32_t rawSeq;
+    bool     hasRawSeq;
     bool valid;            // false if the file couldn't be read/parsed -
                             // e.g. plugin not loaded yet, or no
                             // keyboard/mouse connected (plugin doesn't

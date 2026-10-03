@@ -1,8 +1,10 @@
 #include "input_state_reader.h"
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
-// Meme garde que hiddriver/mapping.h (voir ce fichier pour l'explication
+// Meme garde que X360Remap/mapping.h (voir ce fichier pour l'explication
 // complete) - necessaire ICI AUSSI car ce .cpp inclut rapidjson
 // directement, independamment de mapping.h. Erreur reelle obtenue sans ce
 // garde au premier build Xbox : "fatal error C1189: Unknown machine
@@ -84,8 +86,31 @@ InputStateSnapshot ReadInputState(const char* path) {
             snap.rawLen = (uint8_t)declared;
     }
 
+    // "k:046d:c33a;m:1532:0067" - voir FormatConnectedDevices (X360Remap/main.cpp).
+    if (doc.HasMember("devs") && doc["devs"].IsString()) {
+        snap.hasDevs = true;
+        const char* d = doc["devs"].GetString();
+        while (*d && snap.devCount < 4) {
+            unsigned int v = 0, p = 0;
+            char t = 0;
+            if (sscanf(d, "%c:%4x:%4x", &t, &v, &p) == 3 && (t == 'k' || t == 'm')) {
+                snap.devType[snap.devCount] = t;
+                snap.devVid[snap.devCount]  = (uint16_t)v;
+                snap.devPid[snap.devCount]  = (uint16_t)p;
+                snap.devCount++;
+            }
+            const char* next = strchr(d, ';');
+            if (!next) break;
+            d = next + 1;
+        }
+    }
+
     if (doc.HasMember("tick") && doc["tick"].IsUint())
         snap.tick = doc["tick"].GetUint();
+    if (doc.HasMember("rawSeq") && doc["rawSeq"].IsUint()) {
+        snap.rawSeq = doc["rawSeq"].GetUint();
+        snap.hasRawSeq = true;
+    }
 
     snap.valid = true;
     return snap;

@@ -1,7 +1,7 @@
 #include "config_writer.h"
-#include "../hiddriver/known_titles.h"
-#include "../hiddriver/known_devices.h"
-#include "../hiddriver/mouse_calibration.h" // IsLayoutUsable, pour refuser une disposition bancale
+#include "../X360Remap/known_titles.h"
+#include "../X360Remap/known_devices.h"
+#include "../X360Remap/mouse_calibration.h" // IsLayoutUsable, pour refuser une disposition bancale
 #include <memory>
 #include <fstream>
 #include <iterator>
@@ -9,18 +9,18 @@
 
 // Sous-dossier dedie de l'appli plutot que la racine du disque dur - evite
 // de polluer HDD:\ avec des fichiers qui n'ont de sens que pour cet outil.
-// Le plugin (hiddriver/main.cpp) utilise le meme chemin en dur de son cote -
+// Le plugin (X360Remap/main.cpp) utilise le meme chemin en dur de son cote -
 // voir le commentaire de MountHdd() dans application/main.cpp pour le rappel
 // que ce n'est PAS un dossier prive (les deux .xex tournent dans des
 // process/namespaces differents), juste une convention de rangement partagee.
 static const char* kDefaultConfigPath = "HDD:\\X360RemapStudio\\X360Remap.json";
 static const char* kDefaultBackupPath = "HDD:\\X360RemapStudio\\X360Remap_default.json";
-// Meme chemin en dur que hiddriver/main.cpp (voir sa section
+// Meme chemin en dur que X360Remap/main.cpp (voir sa section
 // "Jalon 7 (suite)" pres de la detection de changement de jeu) - simple
 // convention de rangement partagee, pas de dossier prive (voir le
 // commentaire de kDefaultConfigPath au-dessus).
 static const char* kDefaultKnownTitlesPath = "HDD:\\X360RemapStudio\\known_titles.txt";
-// Meme convention - ecrit uniquement par hiddriver.xex (Jalon 8, suite), lu
+// Meme convention - ecrit uniquement par X360Remap.xex (Jalon 8, suite), lu
 // en lecture seule ici (voir le commentaire de ListKnownDevices dans
 // config_writer.h).
 static const char* kDefaultKnownDevicesPath = "HDD:\\X360RemapStudio\\known_devices.txt";
@@ -34,7 +34,10 @@ bool ApplyKeyboardMapping(uint16_t vid, uint16_t pid, const std::vector<HidKeyMa
     // Load whatever is on disk right now. A missing/unreadable file just
     // means we start from an empty mapping set - not an error worth failing
     // on, since the whole point of this call is to create/update an entry.
-    LoadMappingsFromFile(configPath);
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
 
     // Iterateur plutot que for-range (C++11/VS2012, non supporte par le
     // toolset XDK Xbox 360 - voir mapping_assistant.cpp pour l'explication
@@ -68,6 +71,46 @@ bool ApplyKeyboardMapping(uint16_t vid, uint16_t pid, const std::vector<HidKeyMa
     g_dynamicData.push_back(std::move(data));
 
     return SaveMappingsToFile(configPath);
+}
+
+bool ApplyKeyboardMappingEntry(uint16_t vid, uint16_t pid, const HidKeyMapEntry& entry) {
+    return ApplyKeyboardMappingEntry(vid, pid, entry, kDefaultConfigPath);
+}
+
+bool ApplyKeyboardMappingEntry(uint16_t vid, uint16_t pid, const HidKeyMapEntry& entry,
+                                const char* configPath) {
+    // Charge l'existant AVANT de construire la liste fusionnee - meme ordre
+    // que ApplyKeyboardMapping, necessaire pour que FindMapping voie le
+    // device une fois LoadMappingsFromFile passe.
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
+
+    HidDeviceMapping* existing = FindMapping(vid, pid);
+    std::vector<HidKeyMapEntry> merged;
+    if (existing && existing->keyMap) {
+        merged.assign(existing->keyMap, existing->keyMap + existing->keyMapCount);
+    }
+
+    // Remplace par ACTION (le bouton manette), pas par code clavier : c'est
+    // "quelle touche fait Y desormais" qu'on reassigne, pas "que fait cette
+    // touche precise" - une meme action ne doit jamais avoir deux entrees.
+    bool replaced = false;
+    for (std::vector<HidKeyMapEntry>::iterator it = merged.begin(); it != merged.end(); ++it) {
+        if (it->action == entry.action) {
+            *it = entry;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced)
+        merged.push_back(entry);
+
+    // Delegue l'ecriture reelle a ApplyKeyboardMapping : meme chemin de code
+    // que le wizard sequentiel a partir d'ici, juste avec une liste
+    // pre-fusionnee au lieu d'une liste fraiche.
+    return ApplyKeyboardMapping(vid, pid, merged, configPath);
 }
 
 // Copie brute octet-par-octet - pas besoin de reparser le JSON, on ne fait
@@ -110,6 +153,20 @@ bool RestoreConfigDefault(const char* configPath, const char* backupPath) {
     return CopyFileRaw(backupPath, configPath);
 }
 
+bool RestoreFactoryConfig() {
+    return RestoreFactoryConfig(kDefaultConfigPath);
+}
+
+bool RestoreFactoryConfig(const char* configPath) {
+    std::string tmp = std::string(configPath) + ".tmp";
+    CopyFileRaw(configPath, tmp.c_str());   // filet : absent = rien a sauver
+    std::ofstream out(configPath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) return false;
+    out << "[]\n";
+    out.close();
+    return !out.fail();
+}
+
 bool HasConfigDefault() {
     return HasConfigDefault(kDefaultBackupPath);
 }
@@ -125,7 +182,10 @@ bool ApplyMouseButtonMapping(uint16_t vid, uint16_t pid, const std::vector<Mouse
 
 bool ApplyMouseButtonMapping(uint16_t vid, uint16_t pid, const std::vector<MouseButtonBinding>& bindings,
                               const char* configPath) {
-    LoadMappingsFromFile(configPath);
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
 
     HidDeviceMapping* existing = nullptr;
     for (std::vector<HidDeviceMapping>::iterator it = g_dynamicMappings.begin(); it != g_dynamicMappings.end(); ++it) {
@@ -188,7 +248,10 @@ bool ApplyMouseReportLayout(uint16_t vid, uint16_t pid, const HidReportLayout& l
     if (!IsLayoutUsable(layout))
         return false;
 
-    LoadMappingsFromFile(configPath);
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
 
     HidDeviceMapping* existing = FindMapping(vid, pid);
     if (existing) {
@@ -206,12 +269,49 @@ bool ApplyMouseReportLayout(uint16_t vid, uint16_t pid, const HidReportLayout& l
     return SaveMappingsToFile(configPath);
 }
 
+bool ApplyMouseCountsPerCm(uint16_t vid, uint16_t pid, float countsPerCm) {
+    return ApplyMouseCountsPerCm(vid, pid, countsPerCm, kDefaultConfigPath);
+}
+
+bool ApplyMouseCountsPerCm(uint16_t vid, uint16_t pid, float countsPerCm, const char* configPath) {
+    // Memes bornes que la relecture (mapping.cpp) : une valeur que le plugin
+    // ignorerait ne doit pas etre ecrite en faisant croire qu'elle compte.
+    if (countsPerCm < 20.0f || countsPerCm > 10000.0f)
+        return false;
+
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
+
+    // Recherche dans les SEULES tables dynamiques (pas FindMapping) : un
+    // mapping statique ne serait jamais reecrit dans le fichier.
+    HidDeviceMapping* existing = nullptr;
+    for (std::vector<HidDeviceMapping>::iterator it = g_dynamicMappings.begin(); it != g_dynamicMappings.end(); ++it) {
+        if (it->vendorId == vid && it->productId == pid) {
+            existing = &(*it);
+            break;
+        }
+    }
+    if (existing) {
+        existing->countsPerCm = countsPerCm;
+    } else {
+        HidDeviceMapping fresh = {};
+        fresh.vendorId = vid;
+        fresh.productId = pid;
+        fresh.countsPerCm = countsPerCm;
+        g_dynamicMappings.push_back(fresh);
+    }
+    return SaveMappingsToFile(configPath);
+}
+
 bool ClearMouseReportLayout(uint16_t vid, uint16_t pid) {
     return ClearMouseReportLayout(vid, pid, kDefaultConfigPath);
 }
 
 bool ClearMouseReportLayout(uint16_t vid, uint16_t pid, const char* configPath) {
-    LoadMappingsFromFile(configPath);
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
     HidDeviceMapping* existing = FindMapping(vid, pid);
     if (!existing)
         return false;
@@ -226,7 +326,25 @@ bool ApplyMouseSettings(uint16_t vid, uint16_t pid, int32_t sensitivity, bool in
 
 bool ApplyMouseSettings(uint16_t vid, uint16_t pid, int32_t sensitivity, bool invertY, int32_t deadzone,
                          const char* configPath) {
-    LoadMappingsFromFile(configPath);
+    return ApplyMouseSettingsFull(vid, pid, sensitivity, invertY, deadzone, -1, configPath);
+}
+
+bool ApplyMouseSettings(uint16_t vid, uint16_t pid, int32_t sensitivity, bool invertY, int32_t deadzone,
+                         int32_t antiDeadzone, int32_t antiDeadzoneY, int32_t smoothingMs) {
+    return ApplyMouseSettingsFull(vid, pid, sensitivity, invertY, deadzone, antiDeadzone, kDefaultConfigPath,
+                                  antiDeadzoneY, smoothingMs);
+}
+
+bool ApplyMouseSettingsFull(uint16_t vid, uint16_t pid, int32_t sensitivity, bool invertY, int32_t deadzone,
+                             int32_t antiDeadzone, const char* configPath,
+                             int32_t antiDeadzoneY, int32_t smoothingMs) {
+    if (antiDeadzone > 32767) antiDeadzone = 32767;
+    if (antiDeadzoneY > 32767) antiDeadzoneY = 32767;
+    if (smoothingMs > 200) smoothingMs = 200;
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
 
     HidDeviceMapping* existing = nullptr;
     for (std::vector<HidDeviceMapping>::iterator it = g_dynamicMappings.begin(); it != g_dynamicMappings.end(); ++it) {
@@ -240,6 +358,9 @@ bool ApplyMouseSettings(uint16_t vid, uint16_t pid, int32_t sensitivity, bool in
         if (sensitivity > 0) existing->mouseSensitivity = sensitivity;
         existing->invertMouseY = invertY;
         if (deadzone >= 0) existing->deadzone = deadzone;
+        if (antiDeadzone >= 0) existing->antiDeadzone = antiDeadzone;
+        if (antiDeadzoneY >= 0) existing->antiDeadzoneY = antiDeadzoneY;
+        if (smoothingMs >= 0) existing->smoothingMs = smoothingMs;
     } else {
         HidDeviceMapping fresh = {};
         fresh.vendorId = vid;
@@ -247,6 +368,9 @@ bool ApplyMouseSettings(uint16_t vid, uint16_t pid, int32_t sensitivity, bool in
         fresh.mouseSensitivity = sensitivity > 0 ? sensitivity : 0;
         fresh.invertMouseY = invertY;
         fresh.deadzone = deadzone >= 0 ? deadzone : 0;
+        fresh.antiDeadzone = antiDeadzone >= 0 ? antiDeadzone : 0;
+        fresh.antiDeadzoneY = antiDeadzoneY >= 0 ? antiDeadzoneY : 0;
+        fresh.smoothingMs = smoothingMs >= 0 ? smoothingMs : 0;
         g_dynamicMappings.push_back(fresh);
     }
 
@@ -277,6 +401,10 @@ std::vector<MouseProfileInfo> ListMouseProfiles(uint16_t vid, uint16_t pid, cons
         info.deadzone = p.deadzone;
         info.curveType = p.curveType;
         info.curveExponent = p.curveExponent;
+        info.antiDeadzone = p.antiDeadzone;
+        info.stickLayout = p.stickLayout;
+        info.antiDeadzoneY = p.antiDeadzoneY;
+        info.smoothingMs = p.smoothingMs;
         result.push_back(info);
     }
     return result;
@@ -294,15 +422,39 @@ bool ApplyMouseProfile(uint16_t vid, uint16_t pid, uint32_t titleId,
                         uint8_t curveType, float curveExponent,
                         const char* gameName,
                         const char* configPath) {
-    // Delegue a SetMouseProfile (hiddriver/mapping.cpp) - meme logique
-    // desormais partagee avec hiddriver.xex, qui l'appelle directement pour
+    return ApplyMouseProfileFull(vid, pid, titleId, sensitivity, invertY, deadzone, curveType, curveExponent,
+                                 gameName, -2 /* ne pas toucher */, configPath);
+}
+
+bool ApplyMouseProfile(uint16_t vid, uint16_t pid, uint32_t titleId,
+                        int32_t sensitivity, bool invertY, int32_t deadzone,
+                        uint8_t curveType, float curveExponent,
+                        const char* gameName, int32_t antiDeadzone,
+                        int stickLayout, int32_t antiDeadzoneY, int32_t smoothingMs) {
+    return ApplyMouseProfileFull(vid, pid, titleId, sensitivity, invertY, deadzone, curveType, curveExponent,
+                                 gameName, antiDeadzone, kDefaultConfigPath, stickLayout, antiDeadzoneY, smoothingMs);
+}
+
+bool ApplyMouseProfileFull(uint16_t vid, uint16_t pid, uint32_t titleId,
+                            int32_t sensitivity, bool invertY, int32_t deadzone,
+                            uint8_t curveType, float curveExponent,
+                            const char* gameName, int32_t antiDeadzone,
+                            const char* configPath, int stickLayout,
+                            int32_t antiDeadzoneY, int32_t smoothingMs) {
+    if (antiDeadzone > 32767) antiDeadzone = 32767;
+    // Delegue a SetMouseProfile (X360Remap/mapping.cpp) - meme logique
+    // desormais partagee avec X360Remap.xex, qui l'appelle directement pour
     // le raccourci "sauvegarder le profil depuis le jeu" (Jalon 7, suite) -
     // une seule source de verite pour "qu'est-ce qu'enregistrer un profil
     // veut dire", pas de logique dupliquee a faire diverger entre les deux
     // .xex. Cette fonction reste le seul point qui fait le I/O disque
     // (Load/Save), SetMouseProfile ne manipule que la memoire.
-    LoadMappingsFromFile(configPath);
-    if (!SetMouseProfile(vid, pid, titleId, sensitivity, invertY, deadzone, curveType, curveExponent, gameName))
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
+    if (!SetMouseProfile(vid, pid, titleId, sensitivity, invertY, deadzone, curveType, curveExponent, gameName, antiDeadzone, stickLayout,
+                         antiDeadzoneY, smoothingMs))
         return false;
     return SaveMappingsToFile(configPath);
 }
@@ -354,7 +506,10 @@ std::vector<KnownDeviceInfo> ListKnownDevices(const char* knownDevicesPath) {
 }
 
 bool RemoveMouseProfile(uint16_t vid, uint16_t pid, uint32_t titleId, const char* configPath) {
-    LoadMappingsFromFile(configPath);
+    // AUDIT_2026-09.md (I4) : fichier present mais illisible -> on refuse
+    // d'ecrire, au lieu d'ecraser la configuration avec l'etat en memoire.
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
 
     HidDeviceMapping* existing = nullptr;
     for (std::vector<HidDeviceMapping>::iterator it = g_dynamicMappings.begin(); it != g_dynamicMappings.end(); ++it) {

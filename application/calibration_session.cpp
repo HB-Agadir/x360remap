@@ -16,7 +16,10 @@
 CalibrationSession::CalibrationSession(uint16_t vid, uint16_t pid)
     : vid_(vid), pid_(pid), step_(CALSTEP_REST), lastTick_(0),
       foundX_(false), foundY_(false), foundWheel_(false), foundButton_(false),
-      reportSize_(0) {
+      reportSize_(0), stepStartTick_(0), readyTick_(0), lastSeq_(0), haveSeq_(false),
+      haveLastAccepted_(false) {
+    memset(&lastAccepted_, 0, sizeof(lastAccepted_));
+    for (int i = 0; i < 16; i++) axisBytes_[i] = false;
     memset(&baseline_, 0, sizeof(baseline_));
     memset(&layout_, 0, sizeof(layout_));
     layout_.buttonsOffset = REPORT_FIELD_ABSENT;
@@ -62,26 +65,68 @@ bool CalibrationSession::SampleIsUsefulForStep(const uint8_t* raw, uint8_t len) 
     if (baseline_.length == 0)
         return false;
 
+    // Molette et clic : un changement limite aux octets X/Y deja identifies
+    // n'est qu'un mouvement de la main, pas le geste demande (2026-09-25).
+    const bool ignoreAxes = step_ == CALSTEP_WHEEL_FWD || step_ == CALSTEP_WHEEL_BACK ||
+                            step_ == CALSTEP_CLICK_LEFT;
     uint8_t n = len < baseline_.length ? len : baseline_.length;
     for (uint8_t i = 0; i < n; i++) {
+        if (ignoreAxes && axisBytes_[i])
+            continue;
         if (raw[i] != baseline_.bytes[i])
             return true; // quelque chose a change par rapport au repos
     }
     return false;
 }
 
-void CalibrationSession::Feed(const uint8_t* raw, uint8_t len, uint32_t tick) {
+void CalibrationSession::ResetStepState() {
+    stepStartTick_ = 0;
+    readyTick_ = 0;
+    haveLastAccepted_ = false;
+}
+
+void CalibrationSession::Feed(const uint8_t* raw, uint8_t len, uint32_t tick, uint32_t seq, bool hasSeq) {
     if (Finished() || !raw || len == 0)
         return;
     // Le plugin reecrit le fichier a chaque tour de boucle meme sans nouveau
-    // rapport : sans ce filtre, un meme paquet serait compte des dizaines de
-    // fois et remplirait la jauge sans le moindre geste.
+    // rapport : sans ce filtre, une meme ECRITURE serait lue a chaque image.
     if (tick == lastTick_)
         return;
     lastTick_ = tick;
 
     if (len > 16) len = 16;
     if (reportSize_ == 0) reportSize_ = len;
+
+    const bool newReport = !hasSeq || !haveSeq_ || seq != lastSeq_;
+    if (hasSeq) { lastSeq_ = seq; haveSeq_ = true; }
+
+    if (stepStartTick_ == 0)
+        stepStartTick_ = tick ? tick : 1;
+
+    // Jauge pleine : on ne collecte plus rien (le trajet de la main vers un
+    // bouton ne doit pas salir le geste) ; etape suivante toute seule.
+    if (readyTick_ != 0) {
+        if (hasSeq && (uint32_t)(tick - readyTick_) >= CALIB_AUTO_ADVANCE_MS)
+            Advance();
+        return;
+    }
+
+    if (hasSeq) {
+        // Debut d'etape ignore : la main termine encore le geste precedent.
+        if (step_ != CALSTEP_REST && (uint32_t)(tick - stepStartTick_) < CALIB_GRACE_MS)
+            return;
+        // Deplacements et molette : un NOUVEAU rapport seulement. Au clic,
+        // un rapport deja accepte qui se repete compte aussi (bouton tenu :
+        // la souris n'envoie plus rien tant qu'on ne bouge pas). Au repos,
+        // tout compte (une souris immobile n'envoie rien).
+        if (step_ == CALSTEP_CLICK_LEFT) {
+            if (!newReport && !(haveLastAccepted_ && lastAccepted_.length == len &&
+                                memcmp(lastAccepted_.bytes, raw, len) == 0))
+                return;
+        } else if (step_ != CALSTEP_REST && !newReport) {
+            return;
+        }
+    }
 
     if (!SampleIsUsefulForStep(raw, len))
         return;
@@ -102,6 +147,10 @@ void CalibrationSession::Feed(const uint8_t* raw, uint8_t len, uint32_t tick) {
     case CALSTEP_CLICK_LEFT: click_.push_back(s); break;
     default: break;
     }
+    lastAccepted_ = s;
+    haveLastAccepted_ = true;
+    if (Progress() >= 1.0f)
+        readyTick_ = tick ? tick : 1;
 }
 
 float CalibrationSession::Progress() const {
@@ -136,6 +185,9 @@ void CalibrationSession::Advance() {
 
     if (step_ == CALSTEP_REST)
         baseline_ = BuildBaseline(rest_);
+    if (step_ == CALSTEP_UP)
+        DetectAxesEarly();
+    ResetStepState();
 
     switch (step_) {
     case CALSTEP_REST:       step_ = CALSTEP_RIGHT; break;
@@ -159,10 +211,23 @@ void CalibrationSession::SkipWheel() {
     wheelFwd_.clear();
     wheelBack_.clear();
     step_ = CALSTEP_CLICK_LEFT;
+    ResetStepState();
 }
 
 void CalibrationSession::Cancel() {
     step_ = CALSTEP_FAILED;
+}
+
+void CalibrationSession::DetectAxesEarly() {
+    // Memes detections que FinishDetection, faites des la fin des gestes de
+    // deplacement pour filtrer les etapes molette et clic (voir axisBytes_).
+    bool exclude[16];
+    for (int i = 0; i < 16; i++) exclude[i] = false;
+    DetectedField x = DetectField(baseline_, right_, left_, CALIB_AXIS_X, exclude);
+    MarkFieldExcluded(x, exclude);
+    DetectedField y = DetectField(baseline_, down_, up_, CALIB_AXIS_Y, exclude);
+    MarkFieldExcluded(y, exclude);
+    for (int i = 0; i < 16; i++) axisBytes_[i] = exclude[i];
 }
 
 void CalibrationSession::FinishDetection() {

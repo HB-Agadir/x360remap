@@ -1,5 +1,5 @@
 #pragma once
-#include "../hiddriver/mouse_calibration.h"
+#include "../X360Remap/mouse_calibration.h"
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -36,6 +36,9 @@ const int CALIB_SAMPLES_REST = 12;
 const int CALIB_SAMPLES_MOTION = 10;
 const int CALIB_SAMPLES_WHEEL = 3;   // un cran de molette ne produit que quelques rapports
 const int CALIB_SAMPLES_CLICK = 6;
+// Refonte 2026-09-25 (echec reel chez HB : "X=NON, bouton=non") :
+const uint32_t CALIB_GRACE_MS        = 700;  // debut d'etape ignore : la main finit le geste precedent
+const uint32_t CALIB_AUTO_ADVANCE_MS = 600;  // jauge pleine -> etape suivante toute seule
 
 class CalibrationSession {
 public:
@@ -46,7 +49,17 @@ public:
     // (le plugin reecrit le fichier meme quand rien n'a change).
     // Ne collecte que si l'echantillon apporte une information utile pour
     // l'etape en cours - voir SampleIsUsefulForStep.
-    void Feed(const uint8_t* raw, uint8_t len, uint32_t tick);
+    //
+    // seq/hasSeq (2026-09-25) : numero du rapport souris ecrit par le plugin
+    // (input_state.json, "rawSeq"). Quand il est connu :
+    //  - un geste ne compte que sur un NOUVEAU rapport (plus de paquet
+    //    perime compte dix fois, ni reporte d'une etape sur la suivante) ;
+    //  - le debut de chaque etape est ignore (CALIB_GRACE_MS) ;
+    //  - l'etape suivante demarre toute seule quand la jauge est pleine
+    //    (CALIB_AUTO_ADVANCE_MS) : plus besoin d'aller cliquer "Valider" avec
+    //    la souris, ce trajet salissait les donnees du geste.
+    // Sans seq (ancien plugin), comportement d'avant.
+    void Feed(const uint8_t* raw, uint8_t len, uint32_t tick, uint32_t seq = 0, bool hasSeq = false);
 
     // L'utilisateur valide l'etape (bouton A). Sans effet tant que
     // CanAdvance() est faux : c'est ce qui empeche d'enregistrer une
@@ -95,6 +108,8 @@ public:
 
 private:
     bool SampleIsUsefulForStep(const uint8_t* raw, uint8_t len) const;
+    void ResetStepState();
+    void DetectAxesEarly();
     int  NeededSamples() const;
     void FinishDetection();
 
@@ -112,4 +127,16 @@ private:
     CalibrationBaseline baseline_;
     HidReportLayout layout_;
     uint8_t reportSize_;
+
+    // Etat de l'etape en cours (2026-09-25)
+    uint32_t stepStartTick_;   // 0 = pas encore vu de paquet dans cette etape
+    uint32_t readyTick_;       // 0 = jauge pas encore pleine
+    uint32_t lastSeq_;
+    bool     haveSeq_;
+    CalibrationSample lastAccepted_;
+    bool     haveLastAccepted_;
+    // Octets X/Y detectes a la fin des gestes de deplacement : pendant la
+    // molette et le clic, un paquet qui ne differe du repos QUE sur ces
+    // octets est un simple mouvement de la main, pas le geste demande.
+    bool     axisBytes_[16];
 };

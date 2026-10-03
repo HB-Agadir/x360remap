@@ -1,12 +1,12 @@
 #pragma once
-#include "../hiddriver/mapping.h"
-#include "../hiddriver/mapping_assistant.h"
+#include "../X360Remap/mapping.h"
+#include "../X360Remap/mapping_assistant.h"
 #include <string>
 #include <vector>
 #include <stdint.h>
 
 // Ties together MappingAssistant (portable state machine, already tested in
-// hiddriver/tests/) with the config file it eventually saves to. Deliberately
+// X360Remap/tests/) with the config file it eventually saves to. Deliberately
 // has NO XUI/D3D call anywhere in it, so it can be driven by a test harness
 // exactly like MappingAssistant already is - only main.cpp (the actual XUI
 // screen) touches rendering, and its only job is to call Tick() once per
@@ -48,6 +48,14 @@ public:
     // Only meaningful once IsComplete() is true - saves the assistant's
     // result to X360Remap.json (or configPathOverride, for tests).
     bool SaveResult(const char* configPathOverride = nullptr);
+
+    // Expose les resultats bruts (code+action) sans passer par SaveResult() -
+    // ajoute pour les reglages manuels (2026-08-17) : une session d'un seul
+    // pas doit pouvoir FUSIONNER son unique resultat dans le mapping deja sur
+    // le disque (voir ApplyKeyboardMappingEntry, application/config_writer.h)
+    // au lieu d'ecraser tout le keyMap comme le fait SaveResult(), pense pour
+    // le wizard sequentiel qui reconstruit la liste entiere a chaque session.
+    const std::vector<AssistantResult>& Results() const { return assistant_.Results(); }
 
 private:
     uint16_t vid_;

@@ -36,6 +36,9 @@ extern const uint32_t kKofiUrlHash;
 extern const char* const kGithubUrl;
 extern const uint32_t kGithubUrlHash;
 
+extern const char* const kReleasesUrl;
+extern const uint32_t kReleasesUrlHash;
+
 extern const char* const kYoutubeUrl;
 extern const uint32_t kYoutubeUrlHash;
 

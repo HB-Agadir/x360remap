@@ -29,6 +29,13 @@ const uint32_t kKofiUrlHash = 0xEF4D30D3u;
 const char* const kGithubUrl = "github.com/HB-Agadir";
 const uint32_t kGithubUrlHash = 0x22422515u;
 
+// Page des versions (2026-09-25) - ouverte par le QR code de la page Soutenir
+// (la console ne peut pas interroger GitHub elle-meme, voir ui_glossy.cpp).
+// NOM DU DEPOT A CONFIRMER a sa creation : changer ICI + le hash + RELEASES_URL
+// dans _design_refs/xui_kit/build_kit.py (qui dessine le QR code).
+const char* const kReleasesUrl = "github.com/HB-Agadir/X360Remap/releases/latest";
+const uint32_t kReleasesUrlHash = 0x985D5759u;
+
 const char* const kYoutubeUrl = "youtube.com/@X360Remap";
 const uint32_t kYoutubeUrlHash = 0xC5735EA2u;
 

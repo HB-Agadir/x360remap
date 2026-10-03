@@ -268,7 +268,73 @@ static void TestCancelLeavesNothing() {
     std::printf("  annulation : aucune disposition produite\n");
 }
 
+// Parcours REALISTE (2026-09-25, echec reel chez HB "X=NON, bouton=non") :
+// la souris n'envoie un rapport que quand quelque chose change, le plugin
+// ecrit le DERNIER rapport toutes les 100 ms avec son numero (rawSeq), la
+// Studio lit a 60 images/s. Gestes imparfaits : main qui derive, geste
+// precedent qui deborde sur l'etape suivante, micro-mouvements au clic.
+// Aucun appel a Advance() : tout doit s'enchainer seul.
+struct SimMouse {
+    uint8_t last[4]; uint32_t seq; uint32_t ms;
+    SimMouse() : seq(0), ms(5000) { memset(last, 0, 4); }
+    void Report(uint8_t b, int8_t x, int8_t y, int8_t w) {
+        last[0] = b; last[1] = (uint8_t)x; last[2] = (uint8_t)y; last[3] = (uint8_t)w; seq++;
+    }
+};
+// Avance le temps de `ms` millisecondes : le plugin ecrit toutes les 100 ms,
+// la Studio lit a chaque image (~16 ms) - les lectures entre deux ecritures
+// retombent sur le meme tick et sont ignorees.
+static void Run(CalibrationSession& s, SimMouse& m, uint32_t ms) {
+    for (uint32_t t = 0; t < ms; t += 16) {
+        m.ms += 16;
+        uint32_t writeTick = (m.ms / 100) * 100;
+        s.Feed(m.last, 4, writeTick, m.seq, true);
+    }
+}
+static void TestRealisticWithSeq() {
+    std::printf("TestRealisticWithSeq\n");
+    CalibrationSession s(0x046D, 0xC08B);
+    SimMouse m;
+    // clic sur "Demarrer" avec la souris : appui, relachement, petit mouvement
+    m.Report(1, 0, 0, 0); m.Report(0, 0, 0, 0); m.Report(0, 3, -1, 0);
+    Run(s, m, 2500);                                   // repos (paquet perime x=+3)
+    CHECK(s.Step() == CALSTEP_RIGHT);
+    for (int i = 0; i < 25; i++) { m.Report(0, (int8_t)(6 + i % 5), (int8_t)((i % 3) - 1), 0); Run(s, m, 100); }
+    Run(s, m, 300);                                    // la main s'arrete (dernier paquet perime, vers la droite)
+    for (int i = 0; i < 40 && s.Step() == CALSTEP_RIGHT; i++) { m.Report(0, -4, 1, 0); Run(s, m, 50); }  // trajet parasite
+    CHECK(s.Step() == CALSTEP_LEFT);
+    for (int i = 0; i < 25 && s.Step() == CALSTEP_LEFT; i++) { m.Report(0, (int8_t)-(7 + i % 4), (int8_t)(i % 2), 0); Run(s, m, 100); }
+    Run(s, m, 800);
+    CHECK(s.Step() == CALSTEP_DOWN);
+    for (int i = 0; i < 25 && s.Step() == CALSTEP_DOWN; i++) { m.Report(0, (int8_t)((i % 3) - 1), (int8_t)(5 + i % 4), 0); Run(s, m, 100); }
+    Run(s, m, 800);
+    for (int i = 0; i < 25 && s.Step() == CALSTEP_UP; i++) { m.Report(0, (int8_t)(i % 2), (int8_t)-(5 + i % 3), 0); Run(s, m, 100); }
+    Run(s, m, 800);
+    CHECK(s.Step() == CALSTEP_WHEEL_FWD);
+    Run(s, m, 800);                                    // ecran lu, puis crans avec un peu de mouvement
+    for (int i = 0; i < 10 && s.Step() == CALSTEP_WHEEL_FWD; i++) { m.Report(0, 1, 0, 0); Run(s, m, 60); m.Report(0, 0, 0, 1); Run(s, m, 150); }
+    Run(s, m, 800);
+    CHECK(s.Step() == CALSTEP_WHEEL_BACK);
+    Run(s, m, 800);
+    for (int i = 0; i < 10 && s.Step() == CALSTEP_WHEEL_BACK; i++) { m.Report(0, 0, 0, -1); Run(s, m, 150); m.Report(0, 0, 1, 0); Run(s, m, 60); }
+    Run(s, m, 800);
+    CHECK(s.Step() == CALSTEP_CLICK_LEFT);
+    Run(s, m, 900);
+    m.Report(1, 0, 0, 0); Run(s, m, 300); m.Report(1, 1, 0, 0); Run(s, m, 200);   // tenu, petit mouvement
+    for (int i = 0; i < 30 && !s.Finished(); i++) Run(s, m, 100);
+    CHECK(s.Finished());
+    CHECK(s.Succeeded());
+    const HidReportLayout& l = s.Layout();
+    CHECK(l.valid);
+    CHECK(l.xOffset == 1 && l.xSize == 1);
+    CHECK(l.yOffset == 2 && l.ySize == 1);
+    CHECK(l.wheelOffset == 3);
+    CHECK(l.buttonsOffset == 0);
+    std::printf("  %s\n", s.Summary().c_str());
+}
+
 int main() {
+    TestRealisticWithSeq();
     TestFullRunClassicMouse();
     TestCannotSkipWithoutDoingTheGesture();
     TestDuplicateTickIgnored();
