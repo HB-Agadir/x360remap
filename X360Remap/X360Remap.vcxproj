@@ -97,6 +97,8 @@
     <ClInclude Include="mouse_calibration.h" />
     <ClInclude Include="usb.h" />
     <ClInclude Include="lang.h" />
+    <ClInclude Include="camera_learn.h" />
+    <ClInclude Include="known_controllers.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="hid_parser.cpp" />
@@ -107,6 +109,11 @@
     <ClCompile Include="known_devices.cpp" />
     <ClCompile Include="mouse_calibration.cpp" />
     <ClCompile Include="lang.cpp" />
+    <ClCompile Include="hud_layout.cpp" />
+    <ClCompile Include="camera_learn.cpp" />
+    <ClCompile Include="camera_known.cpp" />
+    <ClCompile Include="known_controllers.cpp" />
+    <ClCompile Include="known_controllers_db.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="xex.xml" />

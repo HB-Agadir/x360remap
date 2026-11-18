@@ -71,6 +71,44 @@ enum NotifyStrId {
 	STR_LIVE_SMOOTH_FMT,             // "Lissage : %d ms (ce jeu)"
 	STR_MOUSEHOOK_ON_FMT,            // "Visee directe active : %hs" (2026-09-26)
 
+	// Camera auto-detection for direct aim (v1.2.1, 2026-10-03), added LAST.
+	STR_LEARN_START,                 // "Camera search: don't touch anything (~30 s). Backspace = cancel"
+	STR_LEARN_PROGRESS_FMT,          // "Camera search: %d%%"
+	STR_LEARN_CONFIRM_FMT,           // "Move the mouse: does the camera follow? F12 = yes, Backspace = next (%d/%d)"
+	STR_LEARN_SAVED,                 // "Direct aim learned and saved for this game"
+	STR_LEARN_SAVED_H,               // "Horizontal aim saved. Vertical stays on the stick"
+	STR_LEARN_NOT_FOUND,             // "Camera not found: this game is not supported yet"
+	STR_LEARN_NO_INPUT,              // "Camera search: the game does not read keyboard/mouse (player 1?)"
+	STR_LEARN_CANCELED,              // "Camera search canceled"
+	STR_LEARN_FAILED,                // "Camera search failed - see X360Remap_plugin.log"
+	STR_LEARN_NEED_GAME,             // "Camera search: start a game first"
+	STR_LEARN_SAVING,                // "Camera found - saving (~30 s), you can play"  (v3, 2026-10-07)
+	STR_LEARN_SESSION_ONLY,          // "Direct aim active until you quit this game (no permanent address)"
+	STR_LEARN_CONFIRM_V_FMT,         // "Now move UP-DOWN. Camera follows: F12. No: Backspace (%d/%d)"  (v4, 2026-10-08)
+	STR_LEARN_STATS_H_FMT,           // "Horizontal: %d values > %d > %d"
+	STR_LEARN_STATS_V_FMT,           // "Vertical: %d values > %d > %d"
+	STR_LEARN_VERTICAL_START,        // "Horizontal OK. Vertical search: hands off"
+	STR_LEARN_RECOMPUTED,            // "Camera found but recalculated by the game each frame: not usable yet"
+	STR_REMAP_PAUSED,                // "X360Remap paused: the controller is player 1 (Win+Shift+X to resume)"
+	STR_REMAP_ACTIVE,                // "X360Remap active: keyboard and mouse are player 1"
+	STR_PLAYERS_MERGED,              // "Players: merged - controller + keyboard/mouse = one player (Scroll Lock)"
+	STR_PLAYERS_SEPARATE,            // "Players: separate - controller and keyboard/mouse are two players (Scroll Lock)"
+	STR_LEARN_BOX_TITLE,
+	STR_LEARN_BOX_START,
+	STR_LEARN_BOX_TEST_H_FMT,
+	STR_LEARN_BOX_TEST_V_FMT,
+	STR_LEARN_BOX_ASK_H,
+	STR_LEARN_BOX_ASK_V,
+	STR_LEARN_BOX_VERTICAL,
+	STR_LEARN_BTN_START,
+	STR_LEARN_BTN_OK,
+	STR_LEARN_BTN_YES,
+	STR_LEARN_BTN_NO,
+	STR_LEARN_BTN_STOP,
+	STR_AIM_OFF,                     // "Direct aim off for this game (Win+Shift+D to turn it back on)"
+	STR_AIM_ON,                      // "Direct aim on"
+	STR_CONFIG_RELOADED,             // "Settings reloaded (Win+Shift+R)"
+
 	STR_NOTIFY_COUNT
 };
 

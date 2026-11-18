@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ABANDONNE (2026-08-01) - voir ARCHITECTURE.md, section "Rendu : Dear ImGui
+  (remplace le plan XUI initial)". Le rendu de application.xex utilise
+  desormais Dear ImGui + D3D9 direct (application/main.cpp,
+  application/third_party/imgui/), plus de pipeline XUI Studio/.xur/.xzp.
+  Fichier garde pour l'historique de la decision, ne plus utiliser.
+
+  PREMIER JET, NON VERIFIE - voir BUILD_APPLICATION.md.
+
+  Ecran du wizard de mapping clavier/souris. Trois elements texte que
+  main.cpp met a jour a chaque frame : le titre, l'invite en cours
+  ("Appuie sur la touche pour: A"), et un message ponctuel (conflit,
+  etape ignoree). Structure XML generale du format XUI (element racine
+  XuiScene, sous-elements XuiText avec un attribut id) - je n'ai pas pu
+  verifier ce fichier contre XUI Studio (outil Windows du XDK que je ne
+  peux pas executer). S'il n'ouvre pas tel quel dans XUI Studio, utilise-le
+  comme plan (noms des elements, texte par defaut) pour recreer l'ecran
+  directement dans l'outil plutot que de chercher a corriger le XML a la main.
+-->
+<XuiScene>
+  <XuiText id="TitleText" x="80" y="60" width="1120" height="60" font="XuiDefault" size="34">
+    Configuration clavier / souris
+  </XuiText>
+
+  <XuiText id="PromptText" x="80" y="300" width="1120" height="80" font="XuiDefault" size="48">
+    Appuie sur une touche pour: A
+  </XuiText>
+
+  <XuiText id="MessageText" x="80" y="400" width="1120" height="50" font="XuiDefault" size="26">
+  </XuiText>
+
+  <XuiText id="HintText" x="80" y="900" width="1120" height="40" font="XuiDefault" size="22">
+    Maintiens 3 secondes pour passer cette etape - BACK pour annuler
+  </XuiText>
+</XuiScene>

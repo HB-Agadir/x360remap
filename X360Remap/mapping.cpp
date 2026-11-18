@@ -224,7 +224,35 @@ HidDeviceMapping* FindMapping(uint16_t vid, uint16_t pid) {
     }
 
     // Fall back to static mappings
-    return FindStaticMapping(vid, pid);
+    HidDeviceMapping* s = FindStaticMapping(vid, pid);
+    if (s) return s;
+
+    // Then the controllers known in advance (plugin only, see
+    // known_controllers.h) - set by the plugin, nullptr elsewhere.
+    return g_extraMappingLookup ? g_extraMappingLookup(vid, pid) : nullptr;
+}
+
+HidDeviceMapping* (*g_extraMappingLookup)(uint16_t vid, uint16_t pid) = nullptr;
+
+bool IsDynamicMapping(const HidDeviceMapping* map) {
+    return map && !g_dynamicMappings.empty() && map >= &g_dynamicMappings[0] &&
+           map <= &g_dynamicMappings[g_dynamicMappings.size() - 1];
+}
+
+void AddDynamicCopy(const HidDeviceMapping& src) {
+    std::unique_ptr<DynamicMappingData> data(new DynamicMappingData());
+    data->axisEntries.assign(src.axisMap, src.axisMap + (src.axisMap ? src.axisMapCount : 0));
+    data->buttonEntries.assign(src.buttonMap, src.buttonMap + (src.buttonMap ? src.buttonMapCount : 0));
+    HidDeviceMapping copy = {};
+    copy.vendorId = src.vendorId;
+    copy.productId = src.productId;
+    copy.invert = src.invert;
+    copy.deadzone = src.deadzone;
+    copy.sensitivityCurveExponent = 1.0f;
+    if (!data->axisEntries.empty()) { copy.axisMap = data->axisEntries.data(); copy.axisMapCount = src.axisMapCount; }
+    if (!data->buttonEntries.empty()) { copy.buttonMap = data->buttonEntries.data(); copy.buttonMapCount = src.buttonMapCount; }
+    g_dynamicData.push_back(std::move(data));
+    g_dynamicMappings.push_back(copy);
 }
 
 static const char* kAxisFieldNames[] = {
@@ -237,6 +265,14 @@ static const char* kButtonFieldNames[] = {
     "back", "start", "l3", "r3",
     "xbox", "dpad_left", "dpad_right", "dpad_up", "dpad_down"
 };
+
+template <class Alloc>
+static rapidjson::Value MacroMaskToJson(uint32_t mask, Alloc& alloc) {
+    rapidjson::Value fields(rapidjson::kArrayType);
+    for (size_t i = 0; i < sizeof(kButtonFieldNames) / sizeof(kButtonFieldNames[0]); i++)
+        if (mask & (1u << i)) fields.PushBack(rapidjson::StringRef(kButtonFieldNames[i]), alloc);
+    return fields;
+}
 
 // Keyboard action names as they appear in X360Remap.json.
 static const struct { const char* name; uint8_t action; } kKeyActionNames[] = {
@@ -292,6 +328,39 @@ const char* KeyActionToName(uint8_t action) {
             return kKeyActionNames[i].name;
     }
     return nullptr;
+}
+
+uint32_t MacroFieldBit(uint8_t ButtonsReport::* field) {
+    if (!field) return 0;
+    for (size_t i = 0; i < sizeof(kButtonFieldNames) / sizeof(kButtonFieldNames[0]); i++)
+        if (GetButtonFieldPtr(kButtonFieldNames[i]) == field) return 1u << i;
+    return 0;
+}
+
+void ApplyMacroMask(ButtonsReport* out, uint32_t mask) {
+    for (size_t i = 0; mask && i < sizeof(kButtonFieldNames) / sizeof(kButtonFieldNames[0]); i++)
+        if (mask & (1u << i)) out->*GetButtonFieldPtr(kButtonFieldNames[i]) = 1;
+}
+
+uint32_t MacroAdvance(const HidButtonMacro& m, MacroPlay& p, uint32_t now, bool held) {
+    const bool pressed = held && !p.wasHeld;
+    p.wasHeld = held;
+    if (p.playing && p.step >= m.stepCount) p.playing = false;   // the mapping was reloaded
+    if (!p.playing) {
+        if (!pressed || m.stepCount == 0) return 0;
+        p.playing = true; p.step = 0; p.stepStart = now; p.delivered = false;
+    }
+    for (;;) {
+        const HidMacroStep& s = m.steps[p.step];
+        if (s.ms == 0) {
+            if (held) { p.delivered = true; return s.mask; }
+            p.playing = false;
+            return 0;
+        }
+        if (!p.delivered || now - p.stepStart < s.ms) { p.delivered = true; return s.mask; }
+        if (++p.step >= m.stepCount) { p.playing = false; return 0; }
+        p.stepStart = now; p.delivered = false;
+    }
 }
 
 static int16_t ButtonsReport::* GetAxisFieldPtr(const char* name) {
@@ -371,6 +440,69 @@ const HidDeviceProfile* FindActiveProfile(const HidDeviceMapping* map, uint32_t 
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// GIMX mouse to stick (1.4.2) - see mapping.h. GIMX core/config.c, mouse2axis1d
+// (aiming mode) and the motion buffer / filter of its mouse control.
+// ---------------------------------------------------------------------------
+void GimxReset(GimxState* s) {
+    memset(s, 0, sizeof(*s));
+}
+
+static float GimxPow(float v, float e) { return (float)pow((double)v, (double)e); }
+
+// One axis. v: motion in counts per 10 ms (already filtered, residue included).
+static int32_t GimxAxis(float v, float multiplier, float exponent, float deadZone, float* residue) {
+    const float scale = 257.0f;              // 8-bit GIMX steps -> 16-bit stick (65535 / 255)
+    const float mult = multiplier * scale, dz = deadZone * scale;
+    const float maxAxis = 32767.0f;
+    if (v == 0.0f) return 0;
+    const float z = (v > 0.0f ? 1.0f : -1.0f) * fabsf(mult) * GimxPow(fabsf(v), exponent) * (mult < 0.0f ? -1.0f : 1.0f);
+    float raw = z > 0.0f ? dz + z : (z < 0.0f ? z - dz : 0.0f);
+    if (raw > maxAxis) raw = maxAxis;
+    if (raw < -maxAxis) raw = -maxAxis;
+    const int32_t axis = (int32_t)raw;       // truncation, like GIMX's int axis
+    // Motion not applied (clamp to full tilt keeps no residue, as in GIMX).
+    float trunk = 0.0f;
+    if (axis > 0 && axis < (int32_t)maxAxis) trunk = (float)axis - dz;
+    else if (axis < 0 && axis > -(int32_t)maxAxis) trunk = (float)axis + dz;
+    if (trunk != 0.0f) {
+        float r = fabsf(v) - GimxPow(fabsf(trunk / mult), 1.0f / exponent);
+        if (fabsf(r) < 0.0039f) r = 0.0f;    // 256 sub-positions, like GIMX
+        *residue = (v * mult) >= 0.0f ? r : -r;
+    } else {
+        *residue = 0.0f;
+    }
+    return axis;
+}
+
+void GimxMouseToStick(const EffectiveMouseSettings& e, GimxState* s, int32_t dx, int32_t dy, uint32_t dtMs,
+                      int32_t* stickX, int32_t* stickY) {
+    if (dtMs == 0) dtMs = 1;
+    if (dtMs > 100) dtMs = 100;              // a long pause is not a fast move
+    const bool moving = dx != 0 || dy != 0;
+    if (!moving) { s->resX = s->resY = 0.0f; }   // no motion: the residue is dropped
+    // counts per 10 ms, plus what the previous poll could not apply
+    const float sx = (float)dx * 10.0f / (float)dtMs + s->resX;
+    const float sy = (float)dy * 10.0f / (float)dtMs + s->resY;
+    s->idx = (s->idx + 1) % GIMX_MAX_BUFFER;
+    s->histX[s->idx] = sx;
+    s->histY[s->idx] = sy;
+    float mx = 0.0f, my = 0.0f, w = 1.0f, div = 0.0f;
+    const int n = e.gimxBuffer < 1 ? 1 : (e.gimxBuffer > GIMX_MAX_BUFFER ? GIMX_MAX_BUFFER : e.gimxBuffer);
+    for (int j = 0; j < n; j++) {
+        int k = s->idx - j;
+        if (k < 0) k += GIMX_MAX_BUFFER;
+        mx += s->histX[k] * w;
+        my += s->histY[k] * w;
+        div += w;
+        w *= e.gimxFilter;
+    }
+    mx /= div; my /= div;
+    const float exponent = e.gimxExponent > 0.0f ? e.gimxExponent : 1.0f;
+    *stickX = GimxAxis(mx, e.gimxMultX, exponent, e.gimxDeadZone, &s->resX);
+    *stickY = GimxAxis(my, e.gimxMultY, exponent, e.gimxDeadZone, &s->resY);
+}
+
 EffectiveMouseSettings ResolveEffectiveMouseSettings(const HidDeviceMapping* map, uint32_t titleId) {
     EffectiveMouseSettings out;
     // Base = reglages du device, memes valeurs/conventions que le code
@@ -384,6 +516,16 @@ EffectiveMouseSettings ResolveEffectiveMouseSettings(const HidDeviceMapping* map
     out.antiDeadzone = map ? map->antiDeadzone : 0;
     int32_t adYRaw = map ? map->antiDeadzoneY : 0;
     out.smoothingMs = map ? map->smoothingMs : 0;
+    out.adsSensitivity = map ? map->adsSensitivity : 0;
+    out.directAimSmoothingMs = map ? map->directAimSmoothingMs : 0;
+    out.adsRampMs = map ? map->adsRampMs : 0;
+    out.gimxOn = map ? map->gimxOn : false;
+    out.gimxDeadZone = map ? map->gimxDeadZone : 0.0f;
+    out.gimxMultX = map ? map->gimxMultX : 1.0f;
+    out.gimxMultY = map ? map->gimxMultY : 1.0f;
+    out.gimxExponent = map ? map->gimxExponent : 1.0f;
+    out.gimxFilter = map ? map->gimxFilter : 0.0f;
+    out.gimxBuffer = map ? map->gimxBuffer : 1;
 
     const HidDeviceProfile* profile = FindActiveProfile(map, titleId);
     if (profile) {
@@ -477,6 +619,85 @@ uint8_t ResolveMergedButtonMap(const HidDeviceMapping* map, uint32_t titleId,
         bool replaced = false;
         for (uint8_t j = 0; j < n; j++) {
             if (out[j].idx == pe.idx) { out[j] = pe; replaced = true; break; }
+        }
+        if (!replaced && n < outCapacity)
+            out[n++] = pe;
+    }
+    return n;
+}
+
+uint8_t GetDefaultKeyMap(HidKeyMapEntry* out, uint8_t outCapacity) {
+    static const HidKeyMapEntry kDefault[] = {
+        { 0x1A, KEYACT_LSTICK_UP },   { 0x16, KEYACT_LSTICK_DOWN },     // W S
+        { 0x04, KEYACT_LSTICK_LEFT }, { 0x07, KEYACT_LSTICK_RIGHT },    // A D
+        { 0x0C, KEYACT_RSTICK_UP },   { 0x0E, KEYACT_RSTICK_DOWN },     // I K
+        { 0x0D, KEYACT_RSTICK_LEFT }, { 0x0F, KEYACT_RSTICK_RIGHT },    // J L
+        { 0x2C, KEYACT_A }, { 0x06, KEYACT_B }, { 0x15, KEYACT_X }, { 0x08, KEYACT_Y },   // Space C R E
+        { 0x14, KEYACT_LB }, { 0x09, KEYACT_RB },                        // Q F
+        { 0x29, KEYACT_START }, { 0x2B, KEYACT_BACK },                   // Esc Tab
+        { 0xE1, KEYACT_LT }, { 0xE0, KEYACT_RT },                        // LShift LCtrl
+        { 0xE2, KEYACT_L3 }, { 0x19, KEYACT_R3 },                        // LAlt V
+        { 0xE6, KEYACT_GUIDE },                                          // RAlt
+        { 0x52, KEYACT_DPAD_UP }, { 0x51, KEYACT_DPAD_DOWN },            // arrows
+        { 0x50, KEYACT_DPAD_LEFT }, { 0x4F, KEYACT_DPAD_RIGHT },
+    };
+    uint8_t n = 0;
+    for (size_t i = 0; i < sizeof(kDefault) / sizeof(kDefault[0]) && n < outCapacity; i++)
+        out[n++] = kDefault[i];
+    return n;
+}
+
+bool IsKnownKeypad(uint16_t vendorId, uint16_t productId) {
+    // Razer Tartarus V2 (022B, 022C variant) and Tartarus Pro (0244).
+    return vendorId == 0x1532 &&
+           (productId == 0x022B || productId == 0x022C || productId == 0x0244);
+}
+
+uint8_t AddKeypadPreset(uint16_t vendorId, uint16_t productId,
+                        HidKeyMapEntry* out, uint8_t count, uint8_t outCapacity) {
+    if (!out || !IsKnownKeypad(vendorId, productId))
+        return count;
+    static const HidKeyMapEntry kTartarus[] = {
+        { 0x1E, KEYACT_START },   // key 01 (sends 1)
+        { 0x22, KEYACT_GUIDE },   // key 05 (sends 5)
+        { 0x39, KEYACT_R3 },      // key 11 (sends Caps Lock)
+        { 0x1D, KEYACT_RT },      // key 17 (sends Z) - fire without a mouse
+    };
+    for (size_t i = 0; i < sizeof(kTartarus) / sizeof(kTartarus[0]); i++) {
+        bool used = false;
+        for (uint8_t j = 0; j < count; j++)
+            if (out[j].code == kTartarus[i].code) { used = true; break; }
+        if (!used && count < outCapacity)
+            out[count++] = kTartarus[i];
+    }
+    return count;
+}
+
+uint8_t ResolveEffectiveKeyMap(const HidDeviceMapping* map, uint32_t titleId,
+                               HidKeyMapEntry* out, uint8_t outCapacity) {
+    if (!out || outCapacity == 0)
+        return 0;
+    uint8_t n = GetDefaultKeyMap(out, outCapacity);
+    if (!map)
+        return n;
+    // Device keys: replace the default with the same action, free the same key.
+    for (uint8_t i = 0; i < map->keyMapCount; i++) {
+        const HidKeyMapEntry& e = map->keyMap[i];
+        uint8_t k = 0;
+        for (uint8_t j = 0; j < n; j++)
+            if (out[j].action != e.action && out[j].code != e.code) out[k++] = out[j];
+        n = k;
+        if (n < outCapacity) out[n++] = e;
+    }
+    // Game profile (quick bind): same key = new action, as before.
+    const HidDeviceProfile* profile = FindActiveProfile(map, titleId);
+    if (!profile)
+        return n;
+    for (uint8_t i = 0; i < profile->keyMapCount; i++) {
+        const HidKeyMapEntry& pe = profile->keyMap[i];
+        bool replaced = false;
+        for (uint8_t j = 0; j < n; j++) {
+            if (out[j].code == pe.code) { out[j] = pe; replaced = true; break; }
         }
         if (!replaced && n < outCapacity)
             out[n++] = pe;
@@ -842,6 +1063,42 @@ bool LoadMappingsFromJson(const std::string& jsonString) {
             }
         }
 
+        // Macros: [ { "idx": 4, "steps": [ { "fields": ["dpad_down"], "ms": 50 }, ... ] },
+        //           { "idx": 5, "fields": ["a_button", "b_button"] } ]   (old form: one held combo)
+        if (entry.HasMember("macros") && entry["macros"].IsArray()) {
+            const Value& macros = entry["macros"];
+            for (SizeType j = 0; j < macros.Size() && data->macroEntries.size() < MAX_MACROS; j++) {
+                const Value& mv = macros[j];
+                if (!mv.IsObject() || !mv.HasMember("idx") || !mv["idx"].IsUint()) continue;
+                HidButtonMacro mc = {};
+                mc.idx = static_cast<uint8_t>(mv["idx"].GetUint());
+                if (mv.HasMember("steps") && mv["steps"].IsArray()) {
+                    const Value& steps = mv["steps"];
+                    for (SizeType k = 0; k < steps.Size() && mc.stepCount < MAX_MACRO_STEPS; k++) {
+                        const Value& sv = steps[k];
+                        if (!sv.IsObject()) continue;
+                        HidMacroStep st = {};
+                        if (sv.HasMember("fields") && sv["fields"].IsArray())
+                            for (SizeType f = 0; f < sv["fields"].Size(); f++)
+                                if (sv["fields"][f].IsString()) st.mask |= MacroFieldBit(GetButtonFieldPtr(sv["fields"][f].GetString()));
+                        const unsigned ms = sv.HasMember("ms") && sv["ms"].IsUint() ? sv["ms"].GetUint() : 0;
+                        st.ms = static_cast<uint16_t>(ms == 0 ? 0 : ms < 16 ? 16 : ms > 5000 ? 5000 : ms);
+                        mc.steps[mc.stepCount++] = st;
+                    }
+                } else if (mv.HasMember("fields") && mv["fields"].IsArray()) {
+                    const Value& fields = mv["fields"];
+                    int n = 0;
+                    for (SizeType k = 0; k < fields.Size(); k++) {
+                        if (!fields[k].IsString()) continue;
+                        const uint32_t bit = MacroFieldBit(GetButtonFieldPtr(fields[k].GetString()));
+                        if (bit && !(mc.steps[0].mask & bit)) { mc.steps[0].mask |= bit; n++; }
+                    }
+                    if (n >= 2) mc.stepCount = 1;   // a single field is a plain button, not a macro
+                }
+                if (mc.stepCount > 0) data->macroEntries.push_back(mc);
+            }
+        }
+
         // Parse keyboard layout: [ { "code": 26, "action": "lstick_up" }, ... ]
         // "code" is the HID usage code of the key (see HidKeyMapEntry).
         if (entry.HasMember("keys") && entry["keys"].IsArray()) {
@@ -958,10 +1215,49 @@ bool LoadMappingsFromJson(const std::string& jsonString) {
             const int ad = entry["antiDeadzoneY"].GetInt();
             if (ad > 0 && ad <= 32767) mapping.antiDeadzoneY = ad;
         }
+        // GIMX method (1.4.2): {"deadZone":34,"multX":3.41,"multY":5.12,"exponent":0.85,
+        // "buffer":1,"filter":0} - values as in GIMX's X360 configs.
+        mapping.gimxOn = false;
+        mapping.gimxDeadZone = 0.0f; mapping.gimxMultX = mapping.gimxMultY = 1.0f;
+        mapping.gimxExponent = 1.0f; mapping.gimxFilter = 0.0f; mapping.gimxBuffer = 1;
+        if (entry.HasMember("gimx") && entry["gimx"].IsObject()) {
+            const rapidjson::Value& g = entry["gimx"];
+            mapping.gimxOn = true;
+            if (g.HasMember("deadZone") && g["deadZone"].IsNumber()) mapping.gimxDeadZone = (float)g["deadZone"].GetDouble();
+            if (g.HasMember("multX") && g["multX"].IsNumber()) mapping.gimxMultX = (float)g["multX"].GetDouble();
+            mapping.gimxMultY = mapping.gimxMultX;
+            if (g.HasMember("multY") && g["multY"].IsNumber()) mapping.gimxMultY = (float)g["multY"].GetDouble();
+            if (g.HasMember("exponent") && g["exponent"].IsNumber()) mapping.gimxExponent = (float)g["exponent"].GetDouble();
+            if (g.HasMember("buffer") && g["buffer"].IsInt()) mapping.gimxBuffer = g["buffer"].GetInt();
+            if (g.HasMember("filter") && g["filter"].IsNumber()) mapping.gimxFilter = (float)g["filter"].GetDouble();
+            // Same limits as GIMX's configuration editor.
+            if (mapping.gimxDeadZone < 0.0f || mapping.gimxDeadZone > 127.0f) mapping.gimxDeadZone = 0.0f;
+            if (mapping.gimxExponent < 0.1f || mapping.gimxExponent > 3.0f) mapping.gimxExponent = 1.0f;
+            if (mapping.gimxBuffer < 1 || mapping.gimxBuffer > GIMX_MAX_BUFFER) mapping.gimxBuffer = 1;
+            if (mapping.gimxFilter < 0.0f || mapping.gimxFilter >= 1.0f) mapping.gimxFilter = 0.0f;
+            if (mapping.gimxMultX == 0.0f) mapping.gimxMultX = 1.0f;
+            if (mapping.gimxMultY == 0.0f) mapping.gimxMultY = 1.0f;
+        }
         mapping.smoothingMs = 0;
         if (entry.HasMember("smoothingMs") && entry["smoothingMs"].IsInt()) {
             const int sm = entry["smoothingMs"].GetInt();
             if (sm > 0 && sm <= 200) mapping.smoothingMs = sm;
+        }
+        // Direct aim settings (2026-10-13, see HidDeviceMapping::adsSensitivity).
+        mapping.adsSensitivity = 0;
+        if (entry.HasMember("adsSensitivity") && entry["adsSensitivity"].IsInt()) {
+            const int a = entry["adsSensitivity"].GetInt();
+            if (a > 0 && a <= 400) mapping.adsSensitivity = a;
+        }
+        mapping.directAimSmoothingMs = 0;
+        if (entry.HasMember("directAimSmoothingMs") && entry["directAimSmoothingMs"].IsInt()) {
+            const int sm = entry["directAimSmoothingMs"].GetInt();
+            if (sm > 0 && sm <= 200) mapping.directAimSmoothingMs = sm;
+        }
+        mapping.adsRampMs = 0;
+        if (entry.HasMember("adsRampMs") && entry["adsRampMs"].IsInt()) {
+            const int r = entry["adsRampMs"].GetInt();
+            if (r > 0 && r <= 1000) mapping.adsRampMs = r;
         }
 
         // Per-game profiles: [ { "titleId": ..., "mouseSensitivity": ...,
@@ -1093,6 +1389,10 @@ bool LoadMappingsFromJson(const std::string& jsonString) {
             mapping.buttonMap = data->buttonEntries.data();
             mapping.buttonMapCount = static_cast<uint8_t>(data->buttonEntries.size());
         }
+        if (!data->macroEntries.empty()) {
+            mapping.macros = data->macroEntries.data();
+            mapping.macroCount = static_cast<uint8_t>(data->macroEntries.size());
+        }
         if (!data->keyEntries.empty()) {
             mapping.keyMap = data->keyEntries.data();
             mapping.keyMapCount = static_cast<uint8_t>(data->keyEntries.size());
@@ -1170,6 +1470,31 @@ std::string SaveMappingsToJson() {
             entry.AddMember("buttons", buttons, alloc);
         }
 
+        // Macros, mirrors the parser above: the old form for one held combo.
+        Value macros(kArrayType);
+        for (uint8_t i = 0; i < m.macroCount; i++) {
+            const HidButtonMacro& mc = m.macros[i];
+            if (mc.stepCount == 0) continue;
+            Value mv(kObjectType);
+            mv.AddMember("idx", mc.idx, alloc);
+            if (mc.stepCount == 1 && mc.steps[0].ms == 0) {
+                mv.AddMember("fields", MacroMaskToJson(mc.steps[0].mask, alloc), alloc);
+            } else {
+                Value steps(kArrayType);
+                for (uint8_t k = 0; k < mc.stepCount; k++) {
+                    Value sv(kObjectType);
+                    sv.AddMember("fields", MacroMaskToJson(mc.steps[k].mask, alloc), alloc);
+                    sv.AddMember("ms", mc.steps[k].ms, alloc);
+                    steps.PushBack(sv, alloc);
+                }
+                mv.AddMember("steps", steps, alloc);
+            }
+            macros.PushBack(mv, alloc);
+        }
+        if (!macros.Empty()) {
+            entry.AddMember("macros", macros, alloc);
+        }
+
         // Keyboard layout - was previously never written back out, so any
         // keyboard mapping produced dynamically (e.g. by a future config
         // assistant) would be silently lost on the next save. See
@@ -1244,6 +1569,25 @@ std::string SaveMappingsToJson() {
         }
         if (m.smoothingMs > 0) {
             entry.AddMember("smoothingMs", m.smoothingMs, alloc);
+        }
+        if (m.gimxOn) {   // GIMX method (1.4.2): kept when a Studio saves the file
+            rapidjson::Value g(rapidjson::kObjectType);
+            g.AddMember("deadZone", (double)m.gimxDeadZone, alloc);
+            g.AddMember("multX", (double)m.gimxMultX, alloc);
+            g.AddMember("multY", (double)m.gimxMultY, alloc);
+            g.AddMember("exponent", (double)m.gimxExponent, alloc);
+            g.AddMember("buffer", m.gimxBuffer, alloc);
+            g.AddMember("filter", (double)m.gimxFilter, alloc);
+            entry.AddMember("gimx", g, alloc);
+        }
+        if (m.adsSensitivity > 0) {
+            entry.AddMember("adsSensitivity", m.adsSensitivity, alloc);
+        }
+        if (m.directAimSmoothingMs > 0) {
+            entry.AddMember("directAimSmoothingMs", m.directAimSmoothingMs, alloc);
+        }
+        if (m.adsRampMs > 0) {
+            entry.AddMember("adsRampMs", m.adsRampMs, alloc);
         }
 
         // Per-game profiles - see HidDeviceProfile's sentinel convention in

@@ -93,7 +93,7 @@ InputStateSnapshot ReadInputState(const char* path) {
         while (*d && snap.devCount < 4) {
             unsigned int v = 0, p = 0;
             char t = 0;
-            if (sscanf(d, "%c:%4x:%4x", &t, &v, &p) == 3 && (t == 'k' || t == 'm')) {
+            if (sscanf(d, "%c:%4x:%4x", &t, &v, &p) == 3 && (t == 'k' || t == 'm' || t == 'c')) {
                 snap.devType[snap.devCount] = t;
                 snap.devVid[snap.devCount]  = (uint16_t)v;
                 snap.devPid[snap.devCount]  = (uint16_t)p;
@@ -103,6 +103,11 @@ InputStateSnapshot ReadInputState(const char* path) {
             if (!next) break;
             d = next + 1;
         }
+    }
+
+    if (doc.HasMember("padBtn") && doc["padBtn"].IsString()) {
+        snap.padBtn = (uint32_t)strtoul(doc["padBtn"].GetString(), 0, 16);
+        snap.hasPadBtn = true;
     }
 
     if (doc.HasMember("tick") && doc["tick"].IsUint())

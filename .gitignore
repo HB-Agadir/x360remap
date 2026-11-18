@@ -363,3 +363,15 @@ MigrationBackup/
 FodyWeavers.xsd
 Release Retail
 *.xdb
+# Coordination between the two Claude conversations (private)
+MESSAGES.md
+CLAUDE.md
+
+# Local only, never in git (2026-11-03)
+X360DebuggerWV-master/
+XboxFreezeLogger/dll/
+XboxFreezeLogger/bin/
+*.dll
+live/
+*.psd
+.vs/

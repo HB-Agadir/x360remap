@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <ProjectGuid>{4B8E2D17-93A6-4F0C-B1D5-6E7A2C9F3B48}</ProjectGuid>
+    <RootNamespace>X360RemapWindows</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)bin\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+    <TargetName>X360RemapStudio</TargetName>
+    <TargetName Condition="'$(Configuration)'=='Debug'">X360RemapStudio_d</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <!-- /utf-8: the sources hold accented texts (4 languages) as UTF-8. -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;_WINSOCK_DEPRECATED_NO_WARNINGS;_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- application\third_party\imgui: the SAME Dear ImGui v1.72b core as the
+           console Studio. X360Remap: mapping.cpp and its rapidjson folder. -->
+      <AdditionalIncludeDirectories>$(ProjectDir)..\application\third_party\imgui;$(ProjectDir)..\X360Remap;$(ProjectDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;user32.lib;gdi32.lib;shell32.lib;comdlg32.lib;ole32.lib;ws2_32.lib;iphlpapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- Only the .pdb file name in the exe, not the build folder (user name). -->
+      <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+    <Manifest>
+      <AdditionalManifestFiles>$(ProjectDir)assets\X360RemapWindows.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <!-- Windows only -->
+    <ClCompile Include="src\win_main.cpp" />
+    <ClCompile Include="src\platform_win.cpp" />
+    <ClCompile Include="src\console_link.cpp" />
+    <ClCompile Include="src\live_watch.cpp" />
+    <ClCompile Include="src\install_win.cpp" />
+    <ClCompile Include="src\update_win.cpp" />
+    <ClCompile Include="src\pc_devices_win.cpp" />
+    <ClCompile Include="src\zip_win.cpp" />
+    <ClCompile Include="src\sync.cpp" />
+    <ClCompile Include="src\key_capture_win.cpp" />
+    <ClCompile Include="src\model_win.cpp" />
+    <ClCompile Include="src\guide_win.cpp" />
+    <ClCompile Include="src\preview_bg_win.cpp" />
+    <ClCompile Include="src\pad_input_win.cpp" />
+    <ClCompile Include="..\X360Remap\known_controllers.cpp" />
+    <ClCompile Include="..\X360Remap\known_controllers_db.cpp" />
+    <ClCompile Include="src\game_tools_win.cpp" />
+    <ClCompile Include="src\camfinder_win.cpp" />
+    <!-- Xenia Camera Finder, shared with its own command line (sibling repository) -->
+    <ClCompile Include="..\..\xenia-camera-finder\src\finder.cpp" />
+    <ClCompile Include="..\..\xenia-camera-finder\src\session.cpp" />
+    <ClCompile Include="..\..\xenia-camera-finder\src\xenia_process.cpp" />
+    <ClCompile Include="..\..\xenia-camera-finder\src\input_screen.cpp" />
+    <ClCompile Include="..\..\xenia-camera-finder\src\overlay.cpp" />
+    <ClCompile Include="src\ui_win.cpp" />
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp" />
+    <!-- Shared with the console Studio: the screens, as is -->
+    <ClCompile Include="..\application\ui_mapping.cpp" />
+    <ClCompile Include="..\application\ui_glossy.cpp" />
+    <ClCompile Include="..\application\overlay_preview.cpp" />
+    <ClCompile Include="..\application\ui_layout.cpp" />
+    <ClCompile Include="..\application\theme.cpp" />
+    <ClCompile Include="..\application\i18n.cpp" />
+    <ClCompile Include="..\application\font_data_inter.cpp" />
+    <ClCompile Include="..\application\font_data_barlow.cpp" />
+    <ClCompile Include="..\application\glossy_assets.cpp" />
+    <ClCompile Include="..\application\aurora_library.cpp" />
+    <ClCompile Include="..\application\config_writer.cpp" />
+    <ClCompile Include="..\application\wizard_session.cpp" />
+    <ClCompile Include="..\application\donation_links.cpp" />
+    <ClCompile Include="..\application\stb_image_impl.cpp" />
+    <ClCompile Include="..\application\third_party\imgui\imgui.cpp" />
+    <ClCompile Include="..\application\third_party\imgui\imgui_draw.cpp" />
+    <ClCompile Include="..\application\third_party\imgui\imgui_widgets.cpp" />
+    <!-- Shared with the plugin: the settings engine, as is -->
+    <ClCompile Include="..\X360Remap\mapping.cpp" />
+    <ClCompile Include="..\X360Remap\mapping_assistant.cpp" />
+    <ClCompile Include="..\X360Remap\mouse_calibration.cpp" />
+    <ClCompile Include="..\X360Remap\known_titles.cpp" />
+    <ClCompile Include="..\X360Remap\known_devices.cpp" />
+    <ClCompile Include="..\X360Remap\camera_learn.cpp" />
+    <ClCompile Include="..\X360Remap\camera_known.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="assets\X360RemapWindows.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\platform_win.h" />
+    <ClInclude Include="src\console_link.h" />
+    <ClInclude Include="src\live_watch.h" />
+    <ClInclude Include="src\install_win.h" />
+    <ClInclude Include="src\update_win.h" />
+    <ClInclude Include="src\sync.h" />
+    <ClInclude Include="src\key_capture_win.h" />
+    <ClInclude Include="src\model_win.h" />
+    <ClInclude Include="src\game_tools_win.h" />
+    <ClInclude Include="src\camfinder_win.h" />
+    <ClInclude Include="src\ui_win.h" />
+    <ClInclude Include="src\win_i18n.h" />
+    <ClInclude Include="third_party\imgui\backends\imgui_impl_win32.h" />
+    <ClInclude Include="third_party\imgui\backends\imgui_impl_dx11.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="assets\X360RemapWindows.manifest" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

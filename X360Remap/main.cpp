@@ -2,6 +2,7 @@
 #include <xkelib.h>
 #include <string>
 #include <fstream>
+#include <stddef.h> // offsetof - clean unplug close requests
 #include <time.h>
 #include <sys/stat.h>
 #include <fstream>
@@ -9,6 +10,7 @@
 #include <vector>
 #include <stdarg.h>
 #include <iterator> // std::istreambuf_iterator - lecture de known_titles.txt (Jalon 7, suite)
+#include <ctype.h>
 #include <math.h>  // powf() - inertie souris->stick, voir XInputdReadStateHook
 #include "Detours.h"
 #include "hid_parser.h"
@@ -18,6 +20,13 @@
 #include "known_devices.h" // Jalon 8 (suite) - historique des peripheriques vus, pour l'ecran de selection d'application.xex
 #include "mouse_calibration.h" // ReadSignedField : lecture des champs aux offsets appris par calibration
 #include "lang.h" // FR/EN pour les notifications XNotifyUI - meme fichier de langue que application/i18n.h
+// Plugin version: log header and X360Remap_status.json (CONTRACT.md).
+#define X360REMAP_VERSION "1.4.1-pre"
+#include "known_controllers.h" // controllers known in advance (SDL GameControllerDB)
+#include "hud_layout.h"
+#include "hud_font.h"
+#include "hud_art.h"
+#include "camera_learn.h" // v1.2.1: camera auto-detection for direct aim (pure logic, tested with g++)
 
 Detour HidAddDeviceDetour;
 Detour HidRemoveDeviceDetour;
@@ -29,6 +38,21 @@ uint16_t swap_endianness_16(uint16_t val) {
 	return (val >> 8) | (val << 8);
 }
 
+// Console temperatures from the SMC (2026-10-30: freezes AND a shutdown
+// after hours of tests - heat must be ruled in or out with data). Free60 SMC
+// docs: command 0x07 = query temperatures; 4 values (CPU, GPU, memory, board)
+// as 16-bit fixed point, 1/256 degree. The raw bytes are logged too, in case
+// the layout differs. Polling thread only (never from a USB callback).
+// Same layout that gave CPU 63 / GPU 57 on HB's console (2026-10-30): 8.8 fixed point,
+// low byte first. Off with disable_temps.txt; called from the polling thread in a game only.
+static void ReadSmcTemps(int* cpu, int* gpu) {
+	BYTE in[0x10] = { 0 }, o[0x10] = { 0 };
+	in[0] = 0x07;
+	HalSendSMCMessage(in, o);
+	const int c = ((int)o[1] | ((int)o[2] << 8)) / 256, g = ((int)o[3] | ((int)o[4] << 8)) / 256;
+	if (c > 0 && c < 120 && g > 0 && g < 120) { *cpu = c; *gpu = g; }   // a bad answer keeps the last value
+}
+
 BOOL IsTrayOpen() {
 	BYTE Input[0x10] = { 0 }, Output[0x10] = { 0 };
 	Input[0] = 0xA;
@@ -37,9 +61,16 @@ BOOL IsTrayOpen() {
 }
 
 // This console likes to kill non system threads on title switches
+// Stack size (2026-11-12, FREEZE_STATIC_ANALYSIS.md): with 0 the kernel gives a system
+// thread 16 KB (ExCreateThread reads 0x4000 from the system process). Read on HB's console
+// after a good boot: the polling thread had used 15.2 KB of it, 11.6 KB in our own frames
+// (CRT streams, rapidjson) and the rest in the file system below. One deeper path (a busy
+// file cache while Aurora loads) runs off the end: the whole console stops, nothing is
+// logged. 64 KB is what XAM gives its own worker threads.
+#define PLUGIN_THREAD_STACK 0x10000
 HANDLE MakeThread(LPTHREAD_START_ROUTINE Address, PVOID arg) {
 	HANDLE Handle = 0;
-	ExCreateThread(&Handle, 0, 0, XapiThreadStartup, Address, arg, (EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424));
+	ExCreateThread(&Handle, PLUGIN_THREAD_STACK, 0, XapiThreadStartup, Address, arg, (EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424));
 	XSetThreadProcessor(Handle, 4);
 	SetThreadPriority(Handle, THREAD_PRIORITY_NORMAL);
 	ResumeThread(Handle);
@@ -140,6 +171,124 @@ static void StudioPath(char* out, int outSize, const char* fileName) {
 	out[outSize - 1] = '\0';
 }
 
+// --- Working folder resolution (2026-10-29) --------------------------------
+// Tester Daniel (360 E Corona, internal hard drive): the plugin ran (keyboard
+// and mouse worked in games) but wrote NOTHING - no log, no status file, so
+// the Studio said "plugin not loaded" and the Studio settings were never read.
+// HB's own log shows the same "no writable storage" at 4.6 s, fixed on his
+// console only because "HDD:" starts working later. On Daniel's console it
+// apparently never does from the plugin (system process).
+//
+// Fix: our OWN link to the hard drive, "X360R:" -> \Device\Harddisk0\
+// Partition1, created in the system namespace under a name nobody else uses
+// (so "Hdd:" and other homebrews are not touched - see the comment above), and
+// retries from the polling thread for 60 s when the drive is not mounted yet.
+static volatile bool g_studioDriveResolved = false;
+// True when the working folder is our own "X360R:" link (last resort). The
+// Studio files written many times a second (input_state.json, status file)
+// are then NOT written: with them, every file going through "X360R:" froze the
+// whole console within ~40 s of opening the Studio (HB, 2026-10-29/30). The
+// log, settings and lists (rare writes) still go through it.
+static volatile bool g_studioDriveIsOwnLink = false;
+enum { STORAGE_PASS_BOOT = 0, STORAGE_PASS_RETRY = 1, STORAGE_PASS_FINAL = 2 };
+
+static void MountOwnHddLink() {
+	STRING link = {};
+	STRING device = {};
+	RtlInitAnsiString(&link, "\\System??\\X360R:");
+	RtlInitAnsiString(&device, "\\Device\\Harddisk0\\Partition1\\");
+	ObCreateSymbolicLink(&link, &device);   // fails harmlessly if it exists
+}
+
+// GitHub issue #8 (2026-11-17, BadUpdate, everything on a USB stick): the plugin ran in
+// games but found no folder ("no writable storage"), so no log, no status file: the
+// Studio said "plugin not loaded" / "keyboard not detected" and never reached the plugin.
+// "Usb0:" does not exist in the system namespace; the Studio itself reaches the stick
+// through \Device\Mass0 (XexUtils MountUsb, confirmed). Our own links to the USB mass
+// storage devices, under names nobody else uses, like X360R: above.
+static void MountOwnUsbLinks() {
+	static const char* const kLinks[3][2] = {
+		{ "\\System??\\X360U0:", "\\Device\\Mass0\\" },
+		{ "\\System??\\X360U1:", "\\Device\\Mass1\\" },
+		{ "\\System??\\X360U2:", "\\Device\\Mass2\\" },
+	};
+	for (int i = 0; i < 3; i++) {
+		STRING link = {}, device = {};
+		RtlInitAnsiString(&link, kLinks[i][0]);
+		RtlInitAnsiString(&device, kLinks[i][1]);
+		ObCreateSymbolicLink(&link, &device);   // fails harmlessly if it exists
+	}
+}
+
+static bool TryStudioDrive(const char* drive, bool create) {
+	char dir[64];
+	_snprintf(dir, sizeof(dir) - 1, "%s\\X360RemapStudio", drive);
+	dir[sizeof(dir) - 1] = '\0';
+	bool ok;
+	if (create)
+		ok = CreateDirectoryA(dir, nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+	else
+		ok = GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES;
+	if (!ok)
+		return false;
+	char tmp[16];
+	_snprintf(tmp, sizeof(tmp) - 1, "%s", drive);
+	tmp[sizeof(tmp) - 1] = '\0';
+	memcpy(g_studioDrive, tmp, sizeof(g_studioDrive));
+	MemoryBarrier();
+	g_studioDriveResolved = true;
+	g_studioDriveIsOwnLink = (strcmp(tmp, "X360R:") == 0);
+	return true;
+}
+
+// ORDER (same rule as the Studio, AUDIT_2026-09.md I3):
+//  1. the hard drive: "HDD:", "Hdd1:", then our own "X360R:" link;
+//  2. internal memory / USB that ALREADY hold X360Remap.json, then the folder;
+//  3. only at the FINAL pass (60 s after boot): the first writable one.
+static bool ResolveStudioDrive(int pass) {
+	static const char* kHdd[] = { "HDD:", "Hdd1:" };
+	static const char* kFallback[] = { "OnBoardMU:", "INTUSB:", "Usb0:", "X360U0:", "X360U1:", "X360U2:" };
+	const int kFallbackCount = (int)(sizeof(kFallback) / sizeof(kFallback[0]));
+	for (int i = 0; i < 2; i++)
+		if (TryStudioDrive(kHdd[i], true)) return true;
+	// No hard drive yet: the USB stick may hold the folder (issue #8). From the polling
+	// thread only, never in DllMain, like X360R: (nothing new at load time).
+	if (pass != STORAGE_PASS_BOOT) MountOwnUsbLinks();
+	// Our own link. Test switch (2026-10-29, freeze with the Studio open on the
+	// first pre14-dev build): disable_own_link.txt in that folder = do not use
+	// "X360R:", keep waiting for "HDD:" / "Hdd1:" like pre13 did.
+	// 2026-10-30: total console freeze (FTP dead too) 3 times with the Studio
+	// open while every file went through "X360R:". Until that is understood,
+	// "X360R:" is a LAST RESORT: only at the final pass, 60 s after boot, when
+	// "HDD:" / "Hdd1:" never worked (Daniel's case). HB's console uses "HDD:"
+	// again, as in pre13.
+	if (pass == STORAGE_PASS_FINAL) {
+		MountOwnHddLink();   // only now: pre13 behaviour until then
+		const DWORD own = GetFileAttributesA("X360R:\\X360RemapStudio");
+		if (own != INVALID_FILE_ATTRIBUTES) {
+			if (GetFileAttributesA("X360R:\\X360RemapStudio\\disable_own_link.txt") != INVALID_FILE_ATTRIBUTES) {
+				if (pass != STORAGE_PASS_FINAL)
+					return false;          // pre13 behaviour: retry HDD: / Hdd1: later
+			} else if (TryStudioDrive("X360R:", true)) {
+				return true;
+			}
+		}
+	}
+	for (int i = 0; i < kFallbackCount; i++) {
+		char probe[96];
+		_snprintf(probe, sizeof(probe) - 1, "%s\\X360RemapStudio\\X360Remap.json", kFallback[i]);
+		probe[sizeof(probe) - 1] = '\0';
+		if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES && TryStudioDrive(kFallback[i], false))
+			return true;
+	}
+	for (int i = 0; i < kFallbackCount; i++)
+		if (TryStudioDrive(kFallback[i], false)) return true;
+	if (pass == STORAGE_PASS_FINAL)
+		for (int i = 0; i < kFallbackCount; i++)
+			if (TryStudioDrive(kFallback[i], true)) return true;
+	return false;
+}
+
 // X360Remap.json est charge/enregistre depuis sept endroits differents.
 // Ces deux enveloppes evitent d'eparpiller la construction du chemin (et donc
 // les occasions de se tromper) ; le tampon reste local a l'appel, donc sur la
@@ -205,6 +354,67 @@ volatile bool g_forceFlushRequested = false;
 // le heartbeat du thread de polling. Reste a 0 tant que l'interrupteur est a 0.
 volatile uint32_t g_interruptErrorStops = 0;
 
+// --- Freeze on unplug: switches that need NO recompiling (2026-10-05) ---
+//
+// The remaining freeze happens sometimes, with any device, mostly on unplug:
+// the signature of a race between the USB stack and our cleanup. Two
+// suspects are left, and each can now be switched with an empty file in the
+// X360RemapStudio folder, read once at boot (see LoadFreezeTestSettings):
+//
+//   1. g_deferReportFree (ON by default, disable_defer_report_free.txt = old
+//      behaviour). The report buffer is the memory the USB stack writes each
+//      packet into (interruptTrb.buffer). It was freed IMMEDIATELY on unplug,
+//      while the interrupt transfer using it is never cancelled - a packet or
+//      the stack's final completion could then write into freed heap memory,
+//      corrupting whatever got that memory next: a random freeze, later, with
+//      any device. Same fix as the driver block: free it 5 s later.
+//   2. g_interruptStatusCheck (OFF by default, enable_interrupt_status_check.txt
+//      turns it on). Never re-queue a transfer that completed with an error
+//      (see EN_TEST_INTERRUPT_STATUS_CHECK near interruptHandler).
+volatile bool g_deferReportFree = true;
+volatile bool g_interruptStatusCheck = false;
+// Clean unplug with dedicated close requests (2026-10-12, see
+// HidControllerExtension::closeReq). ON by default; disable_clean_unplug.txt
+// goes back to the old behaviour (default endpoint closed with controlTrb).
+volatile bool g_cleanUnplug = true;
+
+// Input trace (2026-10-08, HB: in Metro the character keeps walking after the
+// key is released). enable_input_trace.txt in X360RemapStudio\ turns it on:
+// every change of what we hand to the game (sticks, buttons, packet number)
+// is logged, plus one line per second while a stick is held. Tells at once
+// whether WE keep sending the movement, or the game keeps using an old value.
+volatile bool g_inputTrace = false;
+// Players mode. Separate (default since 1.4.2, HB 2026-11-18): the keyboard /
+// mouse is ALWAYS player 1 and a pad is player 2, whatever the plug order -
+// XAM gives slots in plug order, so when a pad holds player 1 the two inputs are
+// swapped at read time (g_displacedPad). Merged (1.3, opt-in): pad + keyboard /
+// mouse = ONE player. Scroll Lock switches in game; players_merged.txt keeps it.
+volatile bool g_playersSeparate = true;
+// Test switch (2026-10-23, freeze when HB's 0079:0006 pad is plugged in, only
+// with the plugin loaded): disable_generic_hid.txt = every HID interface that
+// is not a boot mouse / keyboard goes straight to the console's own driver,
+// untouched by us. Tells whether the freeze comes from our HID path.
+volatile bool g_disableGenericHid = false;
+
+// Stick release ramp (2026-10-08, Metro 2033: the character keeps walking
+// after the key is released - also under Xenia with its own keyboard mode, so
+// it is the game, not us). A key drops the stick from full to 0 in ONE read,
+// something a real stick never does: it always passes through the middle
+// values on its way back. Hypothesis: Metro misses that instant return.
+// enable_stick_release_ramp.txt turns on a 60 ms return to the centre (full
+// -> 2/3 -> 1/3 -> 0) on the LEFT stick only. Off by default until a test
+// proves it; harmless for every other game if it does.
+volatile bool g_stickReleaseRamp = false;
+// Second Metro hypothesis: a real controller's packet number only changes when
+// its state changes; ours (and Xenia's keyboard mode, which shows the same bug)
+// changes on EVERY read. enable_packet_on_change.txt = real-pad behaviour.
+volatile bool g_packetOnChange = false;
+// Metro 2033 keeps walking when the left stick is exactly 0, which a real stick
+// at rest never is (proven on HB's console, 2026-10-31). On for every game, as a
+// real pad behaves; disable_stick_rest_noise.txt turns it off.
+volatile bool g_stickRestNoise = true;
+const DWORD STICK_RAMP_MS = 60;
+
 // --- Miroir DbgPrint : desactive par defaut (2026-08-21) ---
 //
 // SUSPECT PRINCIPAL d'un gel reel signale par un testeur (Cyper) : console qui
@@ -262,16 +472,75 @@ volatile bool g_dbgPrintMirrorEnabled = false;
 // aucune dependance a xbdm : c'est la reponse a "peut-on sortir de l'impasse".
 #define SafeDbgPrint(...) do { if (g_dbgPrintMirrorEnabled) DbgPrint(__VA_ARGS__); } while (0)
 
+// Minimal formatter with NO C runtime call (2026-10-12). FileLog is called
+// from USB callbacks and from the USB add / remove hooks, which run in the
+// USB completion context. The CRT's _vsnprintf touches per-thread data and
+// may take a heap lock there: with a key-report log line in the interrupt
+// callback, the console froze after 1-3 key presses. Supports what the
+// plugin uses: %d %i %u %x %X (width, 0 padding, l / h prefixes), %p, %s /
+// %hs, %c, %%. Anything else prints '?'.
+static int LogAppendNum(char* out, int pos, int cap, unsigned long v, int base, bool upper,
+	bool negative, int width, char padChar) {
+	char tmp[16];
+	int n = 0;
+	const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+	do { tmp[n++] = digits[v % base]; v /= base; } while (v && n < 15);
+	if (negative) tmp[n++] = '-';
+	while (n < width && n < 15) tmp[n++] = padChar;
+	while (n > 0 && pos < cap) out[pos++] = tmp[--n];
+	return pos;
+}
+
+static int LogFormat(char* out, int cap, const char* fmt, va_list args) {
+	int pos = 0;
+	if (!fmt) fmt = "(null format)";
+	for (const char* f = fmt; *f && pos < cap; f++) {
+		if (*f != '%') { out[pos++] = *f; continue; }
+		f++;
+		if (*f == '%') { out[pos++] = '%'; continue; }
+		char padChar = ' ';
+		if (*f == '0') { padChar = '0'; f++; }
+		int width = 0;
+		while (*f >= '0' && *f <= '9') { width = width * 10 + (*f - '0'); f++; }
+		while (*f == 'l' || *f == 'h') f++;   // all integers are 32-bit here
+		switch (*f) {
+		case 'd': case 'i': {
+			int v = va_arg(args, int);   // 32-bit on Xbox 360, like long
+			pos = LogAppendNum(out, pos, cap, v < 0 ? (unsigned long)(0u - (unsigned)v) : (unsigned long)v, 10, false, v < 0, width, padChar);
+			break;
+		}
+		case 'u': pos = LogAppendNum(out, pos, cap, va_arg(args, unsigned int), 10, false, false, width, padChar); break;
+		case 'x': pos = LogAppendNum(out, pos, cap, va_arg(args, unsigned int), 16, false, false, width, padChar); break;
+		case 'X': pos = LogAppendNum(out, pos, cap, va_arg(args, unsigned int), 16, true, false, width, padChar); break;
+		case 'f': case 'g': case 'e': (void)va_arg(args, double); out[pos++] = '?'; break;   // consume the argument
+		case 'p': pos = LogAppendNum(out, pos, cap, (unsigned long)va_arg(args, void*), 16, true, false, 8, '0'); break;
+		case 'c': out[pos++] = (char)va_arg(args, int); break;
+		case 's': {
+			const char* str = va_arg(args, const char*);
+			if (!str) str = "(null)";
+			while (*str && pos < cap) out[pos++] = *str++;
+			break;
+		}
+		case '\0': f--; break;
+		default: out[pos++] = '?'; break;
+		}
+	}
+	return pos;
+}
+
 void FileLog(const char* fmt, ...) {
 	char line[256];
-	int prefixLen = _snprintf(line, sizeof(line) - 2, "[%lums] ", GetTickCount());
-	if (prefixLen < 0 || prefixLen > (int)sizeof(line) - 2) prefixLen = (int)sizeof(line) - 2;
+	int prefixLen = 0;
+	line[prefixLen++] = '[';
+	prefixLen = LogAppendNum(line, prefixLen, (int)sizeof(line) - 2, GetTickCount(), 10, false, false, 0, ' ');
+	line[prefixLen++] = 'm'; line[prefixLen++] = 's'; line[prefixLen++] = ']'; line[prefixLen++] = ' ';
 
 	va_list args;
 	va_start(args, fmt);
-	_vsnprintf(line + prefixLen, sizeof(line) - prefixLen - 2, fmt, args);
+	int end = prefixLen + LogFormat(line + prefixLen, (int)sizeof(line) - 2 - prefixLen, fmt, args);
 	va_end(args);
-	line[sizeof(line) - 2] = '\0';
+	if (end > (int)sizeof(line) - 2) end = (int)sizeof(line) - 2;
+	line[end] = '\0';
 
 	int lineLen = (int)strlen(line);
 
@@ -336,6 +605,631 @@ static void LoadDbgPrintMirrorSetting() {
 //
 // Appelee depuis DllMain APRES initFunctionPointers(), pour que ce choix
 // explicite prime sur la detection automatique du patch.
+// Reads the two freeze-test switches (see g_deferReportFree). Called once
+// from DllMain, before any USB hook can run.
+// --- In-game overlay, step 2: one test rectangle (2026-10-31, enable_overlay.txt) ---
+// VdSwap (kernel ordinal 603, arguments as in Xenia's xboxkrnl_video.cc) is
+// called once per game frame with the front buffer. It runs in the game's render
+// thread, so no log, CRT or XAM here: the polling thread writes the result.
+typedef void (*VdSwapFn)(void*, void*, void*, void*, void*, DWORD*, DWORD*, DWORD*, DWORD*, DWORD*);
+static Detour VdSwapDetour;
+static volatile LONG  g_swapCount = 0;
+static volatile DWORD g_swapFront = 0, g_swapFormat = 0, g_swapWidth = 0, g_swapHeight = 0;
+static volatile DWORD g_swapFetch[6];
+extern DWORD g_lastTitleId;
+// 0 = Aurora, FFFE.... = dashboard, F5D1.... = boot animation (it froze on the overlay).
+static bool IsGameTitle(DWORD title) { return title != 0 && (title >> 24) != 0xFF && (title >> 24) != 0xF5; }
+// What the overlay shows. Written by the USB callbacks: plain fields only.
+static volatile uint8_t g_overlayKeys[6], g_overlayMods, g_overlayMouse;
+// Text lines, written by the polling thread only.
+const int HUD_LINES = 7, HUD_LINE_CHARS = 26;
+static char g_hudLines[HUD_LINES][HUD_LINE_CHARS];
+static volatile bool g_hudVisible = true;
+// HB (2026-11-09): the keyboard / controller drawing waits for the shortcut, even when chosen in the Studio.
+static volatile bool g_hudInputShown = false;
+// A game sets up its screen while it starts: drawing then froze the console (2026-11-01).
+static volatile bool g_hudGameReady = false;
+// overlay_settings.txt, one "name value" per line; colours are RRGGBB.
+static DWORD g_hudColorOn = 0xFFE020, g_hudColorOff = 0xFFFFFF;
+static DWORD g_hudKeysX = 20, g_hudKeysY = 590, g_hudInfoX = 1000, g_hudInfoY = 40;
+static bool g_hudInfoAlways = false;
+static volatile bool g_hudEnabled = true;
+// HB (2026-11-04): the input drawing is a learning aid, off by default, and the
+// player picks ONE: keyboard and mouse, or the controller (keys win if both are set).
+static bool g_hudShowKeys = false, g_hudShowInfo = true, g_hudShowPad = false, g_hudShowStats = true;
+static bool g_hudNoTemps = false;   // disable_temps.txt: the SMC read is suspect, see ReadSmcTemps
+// Last pad state a game read, for the controller drawing. Written by the game's
+// XInput thread, read by the render thread: a torn copy only shows one frame wrong.
+static volatile XINPUT_GAMEPAD g_hudPad;
+static volatile DWORD g_hudPadTick = 0;
+static bool HudStickOff(int16_t v) { return v > 3000 || v < -3000; }
+// Several slots are read each frame (pad, keyboard / mouse): the one in use wins,
+// a resting one only after 80 ms without any.
+static void HudNotePad(const XINPUT_GAMEPAD* p) {
+	const bool active = p->wButtons || p->bLeftTrigger > 8 || p->bRightTrigger > 8 || HudStickOff(p->sThumbLX) ||
+		HudStickOff(p->sThumbLY) || HudStickOff(p->sThumbRX) || HudStickOff(p->sThumbRY);
+	const DWORD now = GetTickCount();
+	if (!active && (now - g_hudPadTick) < 80) return;
+	memcpy((void*)&g_hudPad, p, sizeof(*p));
+	if (active) g_hudPadTick = now;
+}
+static DWORD g_hudInfoSecs = 4;
+static DWORD g_hudHotkey = 0xE3;   // HID usage; 0xE3 = either Windows key
+static int g_hudStyle = 1;   // 1 = Kenney key images, 0 = drawn keys
+static volatile DWORD g_hudInfoUntil = 0;   // aim settings stay 4 s after a change
+static volatile LONG g_hudFrames = 0;
+static char g_hudStats[40] = "";
+// Messages (recording started...), two buffers so the render thread never reads one being written.
+static char g_hudToast[2][56];
+static volatile int g_hudToastSet = 0;
+static volatile DWORD g_hudToastUntil = 0;
+static bool g_overlayProbe = false;
+
+// Texel index of (x, y) in a tiled 32-bit surface (XGAddress2DTiledOffset).
+static DWORD TiledOffset32(DWORD x, DWORD y, DWORD alignedWidth) {
+	const DWORD macro = ((x >> 5) + (y >> 5) * (alignedWidth >> 5)) << 9;
+	const DWORD micro = ((x & 7) + ((y & 6) << 2)) << 2;
+	const DWORD off = macro + ((micro & ~15u) << 1) + (micro & 15) + ((y & 8) << 5) + ((y & 1) << 4);
+	return (((off & ~511u) << 3) + ((off & 448) << 2) + (off & 63) + ((y & 16) << 7) +
+		((((y & 8) >> 2) + (x >> 3)) & 3) * 64) >> 2;
+}
+
+// The frame being drawn on, from VdSwap's fetch constant (bits as in Xenia's xenos.h:
+// dword_0 pitch / 32 in bits 22-30, tiled in bit 31; dword_1 format in bits 0-5).
+// 32-bit formats only; the game can repaint between two frames.
+static volatile DWORD* g_hudBase;
+static DWORD g_hudOn, g_hudOff, g_hudShade, g_hudTag;
+static bool g_hudWide, g_hudTiled = true;
+static DWORD g_hudW = 1280, g_hudH = 720, g_hudPitch = 1280;
+
+static void HudPixel(DWORD x, DWORD y, DWORD color) {
+	if (x >= g_hudW || y >= g_hudH) return;
+	volatile DWORD* p = g_hudBase + (g_hudTiled ? TiledOffset32(x, y, g_hudPitch) : y * g_hudPitch + x);
+	*p = color;
+	__dcbf(0, (void*)p);
+}
+
+// Never reads the frame: reading made the overlay late and speckled (2026-11-01).
+static void HudBlend(DWORD x, DWORD y, DWORD color, DWORD alpha) {
+	if (alpha >= 8) HudPixel(x, y, color);
+}
+
+// Positions are set for 1280x720: on another screen size each one keeps its
+// distance to the nearest edge, and the drawings keep their size.
+static DWORD HudAx(DWORD x) { const int v = (int)x + (int)g_hudW - 1280; return x > 640 ? (DWORD)(v > 0 ? v : 0) : x; }
+static DWORD HudAy(DWORD y) { const int v = (int)y + (int)g_hudH - 720; return y > 360 ? (DWORD)(v > 0 ? v : 0) : y; }
+
+// Rounded key, leaning right by skew pixels; edges are smoothed.
+static void HudKeyShape(DWORD x, DWORD y, DWORD w, DWORD h, DWORD skew, bool filled, DWORD color) {
+	static const DWORD kInset[5] = { 5, 3, 2, 1, 1 };
+	for (DWORD j = 0; j < h; j++) {
+		const DWORD lean = skew * 16 * (h - 1 - j) / (h - 1);    // 1/16 pixel
+		const DWORD frac = lean & 15, base = x + (lean >> 4);
+		DWORD inset = 0;
+		if (j < 5) inset = kInset[j];
+		else if (j >= h - 5) inset = kInset[h - 1 - j];
+		const DWORD left = base + inset, right = base + w - 1 - inset;
+		const bool edgeRow = j < 2 || j >= h - 2;
+		if (filled || edgeRow) {
+			for (DWORD i = left + 1; i < right; i++) HudBlend(i, y + j, color, 15);
+		} else {
+			HudBlend(left + 1, y + j, color, 15);
+			HudBlend(right - 1, y + j, color, 15);
+		}
+		HudBlend(left, y + j, color, 15 - frac);
+		HudBlend(right, y + j, color, frac ? frac : 15);
+	}
+}
+
+static DWORD HudText(DWORD x, DWORD y, const char* text, DWORD color, bool small) {
+	const HudGlyph* glyphs = small ? kHudSmallGlyphs : kHudBigGlyphs;
+	const uint8_t* data = small ? kHudSmallData : kHudBigData;
+	const DWORD h = small ? HUD_SMALL_HEIGHT : HUD_BIG_HEIGHT;
+	for (; *text; text++) {
+		const unsigned char ch = (unsigned char)*text;
+		if (ch < 32 || ch > 126) continue;
+		const HudGlyph& g = glyphs[ch - 32];
+		for (DWORD j = 0; j < h; j++)
+			for (DWORD i = 0; i < g.w; i++) HudBlend(x + i, y + j, color, data[g.offset + j * g.w + i]);
+		x += g.advance;
+	}
+	return x;
+}
+static DWORD HudTextWidth(const char* text, bool small) {
+	DWORD w = 0;
+	for (; *text; text++) {
+		const unsigned char ch = (unsigned char)*text;
+		if (ch >= 32 && ch <= 126) w += (small ? kHudSmallGlyphs : kHudBigGlyphs)[ch - 32].advance;
+	}
+	return w;
+}
+// Readable anywhere: a soft dark copy under the text.
+static DWORD HudTextShadow(DWORD x, DWORD y, const char* text, DWORD color, bool small) {
+	HudText(x + 1, y + 1, text, g_hudShade, small);
+	return HudText(x, y, text, color, small);
+}
+
+#include "hud_color.h"
+static DWORD g_hudFetch1, g_hudFetch3;   // the frame being drawn on, set by OverlayDraw
+static DWORD HudColor(DWORD rgb, bool wide) { return HudPackColor(rgb, wide, g_hudFetch1, g_hudFetch3); }
+
+// The polling thread fills the unused set and flips g_hudCapSet, so the render
+// thread never reads a list being rewritten.
+static HudCap g_hudCaps[2][HUD_MAX_CAPS];
+static int g_hudCapCount[2];
+static volatile int g_hudCapSet = 0;
+static DWORD g_hudBlockY, g_hudBlockW;
+
+static bool HudKeyDown(uint8_t code) {
+	if (code >= 0xE0 && code <= 0xE7) return (g_overlayMods >> (code - 0xE0)) & 1;
+	for (int i = 0; i < 6; i++) if (g_overlayKeys[i] == code) return true;
+	return false;
+}
+
+// Kenney "Input Prompts" key (CC0). False when the pack has no image for this key.
+static bool HudDrawKeySprite(uint8_t code, DWORD x, DWORD y, bool down) {
+	for (size_t i = 0; i < sizeof(kHudSprites) / sizeof(kHudSprites[0]); i++) {
+		if (kHudSprites[i].code != code) continue;
+		const uint8_t* p = kHudSpriteData + kHudSprites[i].offset;
+		if (down) HudKeyShape(x + 4, y + 4, 28, 28, 0, true, g_hudOn);
+		const DWORD color = down ? g_hudShade : g_hudOff;
+		for (int k = 0; k < kHudSprites[i].bytes; k += 2) HudPixel(x + p[k], y + p[k + 1], color);
+		return true;
+	}
+	return false;
+}
+
+// Small Xbox button: coloured disc for A B X Y, plain text for the others.
+static void HudActionIcon(DWORD x, DWORD y, uint8_t action, bool wide) {
+	static const DWORD kFace[4] = { 0x6FBF3A, 0xE5413B, 0x2F8DE8, 0xF0B429 };
+	const char* tag = HudActionLabel(action);
+	if (action >= KEYACT_A && action <= KEYACT_Y) {
+		const DWORD color = HudColor(kFace[action - KEYACT_A], wide);
+		for (int j = 0; j < HUD_DISC; j++)
+			for (int i = 0; i < HUD_DISC; i++) HudBlend(x + i, y + j, color, kHudDisc[j * HUD_DISC + i]);
+		HudText(x + 3, y + 2, tag, HudColor(0xFFFFFF, wide), true);
+	} else {
+		HudText(x, y + 2, tag, g_hudTag, true);
+	}
+}
+
+static void HudPadArea(DWORD x, DWORD y, int area, DWORD color) {
+	const uint8_t* p = kHudPadAreas[area];
+	for (int i = 0; i < kHudPadAreaBytes[area]; i += 2) HudBlend(x + p[i], y + p[i + 1], color, 15);
+}
+
+// A trigger fills from the bottom, as far as it is pressed.
+static void HudPadTrigger(DWORD x, DWORD y, int area, uint8_t value) {
+	if (value < 8) return;
+	const uint8_t* p = kHudPadAreas[area];
+	int top = 255, bottom = 0;
+	for (int i = 1; i < kHudPadAreaBytes[area]; i += 2) {
+		if (p[i] < top) top = p[i];
+		if (p[i] > bottom) bottom = p[i];
+	}
+	const int cut = bottom - (bottom - top + 1) * value / 255;
+	for (int i = 0; i < kHudPadAreaBytes[area]; i += 2)
+		if (p[i + 1] > cut) HudBlend(x + p[i], y + p[i + 1], g_hudOn, 15);
+}
+
+static void HudPadStick(DWORD x, DWORD y, int16_t sx, int16_t sy, DWORD color) {
+	const int dx = sx * HUD_PAD_STICK_REACH / 32768, dy = -sy * HUD_PAD_STICK_REACH / 32768;
+	for (int j = -2; j <= 2; j++)
+		for (int i = -2; i <= 2; i++)
+			if (i * i + j * j <= 5) HudBlend(x + dx + i, y + dy + j, color, 15);
+}
+
+// HB's two-view controller (2026-11-03): what the game receives, so a keyboard
+// key lights the Xbox button it stands for.
+static void HudDrawPad(DWORD x, DWORD y) {
+	XINPUT_GAMEPAD pad;
+	memcpy(&pad, (const void*)&g_hudPad, sizeof(pad));
+	static const struct { WORD bit; uint8_t area; } kBits[] = {
+		{ XINPUT_GAMEPAD_A, HUD_PAD_A }, { XINPUT_GAMEPAD_B, HUD_PAD_B }, { XINPUT_GAMEPAD_X, HUD_PAD_X },
+		{ XINPUT_GAMEPAD_Y, HUD_PAD_Y }, { XINPUT_GAMEPAD_BACK, HUD_PAD_BACK }, { XINPUT_GAMEPAD_START, HUD_PAD_START },
+		{ XINPUT_GAMEPAD_LEFT_THUMB, HUD_PAD_LS }, { XINPUT_GAMEPAD_RIGHT_THUMB, HUD_PAD_RS },
+		{ XINPUT_GAMEPAD_LEFT_SHOULDER, HUD_PAD_LB }, { XINPUT_GAMEPAD_RIGHT_SHOULDER, HUD_PAD_RB },
+		{ XINPUT_GAMEPAD_DPAD_UP, HUD_PAD_DU }, { XINPUT_GAMEPAD_DPAD_DOWN, HUD_PAD_DD },
+		{ XINPUT_GAMEPAD_DPAD_LEFT, HUD_PAD_DL }, { XINPUT_GAMEPAD_DPAD_RIGHT, HUD_PAD_DR },
+	};
+	for (size_t i = 0; i < sizeof(kBits) / sizeof(kBits[0]); i++)
+		if (pad.wButtons & kBits[i].bit) HudPadArea(x, y, kBits[i].area, g_hudOn);
+	HudPadTrigger(x, y, HUD_PAD_LT, pad.bLeftTrigger);
+	HudPadTrigger(x, y, HUD_PAD_RT, pad.bRightTrigger);
+	for (int i = 0; i < (int)sizeof(kHudPadOutline); i += 2)
+		HudBlend(x + kHudPadOutline[i], y + kHudPadOutline[i + 1], g_hudOff, 15);
+	HudPadStick(x + HUD_PAD_LS_X, y + HUD_PAD_LS_Y, pad.sThumbLX, pad.sThumbLY,
+		(pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) ? g_hudShade : g_hudOn);
+	HudPadStick(x + HUD_PAD_RS_X, y + HUD_PAD_RS_Y, pad.sThumbRX, pad.sThumbRY,
+		(pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) ? g_hudShade : g_hudOn);
+}
+
+static void OverlayDraw(DWORD front, DWORD fetch0, DWORD fetch1, DWORD fetch3, DWORD width, DWORD height) {
+	if (!MmIsAddressValid((PVOID)front)) return;
+	// 6 / 50 = 8_8_8_8, 7 / 54 (0x36, Metro) = 2_10_10_10; any other format is not drawn on.
+	const DWORD format = fetch1 & 0x3F;
+	const bool wide = format == 7 || format == 54;
+	if (!wide && format != 6 && format != 50) return;
+	const DWORD pitch = ((fetch0 >> 22) & 0x1FF) * 32;
+	if (pitch < width) return;
+	g_hudBase = (volatile DWORD*)front;
+	g_hudW = width; g_hudH = height; g_hudPitch = pitch; g_hudTiled = (fetch0 >> 31) != 0;
+	g_hudWide = wide;
+	g_hudFetch1 = fetch1; g_hudFetch3 = fetch3;
+	g_hudOn = HudColor(g_hudColorOn, wide);
+	g_hudOff = HudColor(g_hudColorOff, wide);
+	g_hudShade = HudColor(0x05090C, wide);
+	g_hudTag = HudColor(0xB8C6D0, wide);
+	if (g_hudShowKeys && g_hudInputShown) {
+		const DWORD ox = HudAx(g_hudKeysX), oy = HudAy(g_hudBlockY);
+		const int set = g_hudCapSet;
+		for (int k = 0; k < g_hudCapCount[set]; k++) {
+			const HudCap& cap = g_hudCaps[set][k];
+			const bool down = HudKeyDown(cap.code);
+			const DWORD x = ox + cap.x, y = oy + cap.y;
+			if (g_hudStyle && HudDrawKeySprite(cap.code, x, y, down)) {
+				HudActionIcon(x + HUD_SPRITE + 1, y + 11, cap.action, wide);
+				continue;
+			}
+			HudKeyShape(x, y, cap.w, 30, 5, down, down ? g_hudOn : g_hudOff);
+			HudTextShadow(x + 8, y + 6, cap.label, down ? g_hudShade : g_hudOff, false);
+			HudActionIcon(x + cap.w - 17, y + 8, cap.action, wide);
+		}
+		// Mouse: left, right, wheel, body, side buttons (HID bits 0, 1, 2, 3, 4).
+		const uint8_t m = g_overlayMouse;
+		const DWORD mx = ox + g_hudBlockW + 14, my = oy;
+		for (int area = 0; area < 5; area++) {
+			if (!(m & (1 << area))) continue;
+			for (int i = 0; i < kHudMouseAreaBytes[area]; i += 2)
+				HudPixel(mx + kHudMouseAreas[area][i], my + kHudMouseAreas[area][i + 1], g_hudOn);
+		}
+		for (int i = 0; i < (int)sizeof(kHudMouseOutline); i += 2)
+			HudPixel(mx + kHudMouseOutline[i], my + kHudMouseOutline[i + 1], g_hudOff);
+	}
+	if (g_hudShowPad && !g_hudShowKeys && g_hudInputShown)
+		HudDrawPad(HudAx(g_hudKeysX), HudAy(g_hudKeysY + HUD_PAD_H > 712 ? 712 - HUD_PAD_H : g_hudKeysY));
+
+	if (g_hudShowStats) {
+		const DWORD w = HudTextWidth(g_hudStats, false);
+		HudTextShadow(w + 20 < g_hudW ? g_hudW - 12 - w : 8, 8, g_hudStats, HudColor(0x7BE36A, wide), false);
+	}
+	if (GetTickCount() < g_hudToastUntil) {
+		const char* text = g_hudToast[g_hudToastSet];
+		const DWORD w = HudTextWidth(text, false) + 32, tx = w < g_hudW ? (g_hudW - w) / 2 : 0, ty = 48;
+		for (DWORD j = 2; j < 36; j++)
+			for (DWORD i = 2 + (j & 1); i < w - 2; i += 2) HudBlend(tx + i, ty + j, g_hudShade, 15);
+		HudKeyShape(tx, ty, w, 38, 0, false, g_hudOn);
+		HudText(tx + 16, ty + 10, text, g_hudOff, false);
+	}
+
+	// HB (2026-11-09): no aim panel on the picture, F12 and the tuning keys stay Xbox notifications.
+	__sync();
+}
+
+// Flicker / tremble (HB, rgdshock): VdSwap only QUEUES the swap. The game's resolve
+// of this frame into *front runs on the GPU later, and overwrites what we draw right
+// after VdSwap on the frames where the GPU is behind: the drawing is there on some
+// frames only. draw_mode 1 (overlay_settings.txt, read live) draws into the PREVIOUS
+// front instead, whose resolve is over. Only when the game's buffer rotation is
+// confirmed (the front from 2 or 3 swaps ago is the current one) and the previous
+// front has the same fetch constant (size, pitch, format): a front the game just
+// freed (menu, resolution change) breaks the pattern and nothing is drawn.
+static volatile DWORD g_hudDrawMode = 0;
+static DWORD g_prevFront[3] = { 0, 0, 0 };   // [0] = previous swap, [1] = 2 swaps ago, [2] = 3
+static DWORD g_prevFetch0 = 0, g_prevFetch1 = 0;
+
+// Exit hangs (2026-11-12, 11-13, and 11-17 quitting Metro 2033 through the Guide's "Aurora
+// Home"): the game froze while quitting, the console alive, our drawing still writing into
+// its pictures. Nothing is drawn while the Xbox Guide is open nor 1.5 s after it closes:
+// quitting through the Guide happens entirely inside that window. Set by the polling
+// thread (XamIsUIActive is XAM: never called from the game's render thread).
+static volatile DWORD g_hudUiQuietUntil = 0;
+
+// Restored from 6e14257 (removed in 71fa5a6 with another change when game launches froze;
+// the capture module was later found to carry those freezes). When a game quits, or
+// between two titles, it presents frames from buffers it is about to free or never used
+// before: draw only on a buffer seen for 30 of its own frames, at a size unchanged for 2 s.
+static bool FrontIsSettled(DWORD front, DWORD width, DWORD height) {
+	static DWORD s_w = 0, s_h = 0, s_sameSize = 0;
+	static DWORD s_front[4] = { 0, 0, 0, 0 }, s_seen[4] = { 0, 0, 0, 0 };
+	if (width != s_w || height != s_h) {
+		s_w = width; s_h = height; s_sameSize = 0;
+		for (int i = 0; i < 4; i++) s_front[i] = s_seen[i] = 0;
+	}
+	if (s_sameSize < 0x7FFFFFFF) s_sameSize++;
+	int slot = -1;
+	for (int i = 0; i < 4 && slot < 0; i++) if (s_front[i] == front) slot = i;
+	if (slot < 0) {   // a buffer not seen yet: take the least used slot
+		slot = 0;
+		for (int i = 1; i < 4; i++) if (s_seen[i] < s_seen[slot]) slot = i;
+		s_front[slot] = front; s_seen[slot] = 0;
+	}
+	if (s_seen[slot] < 0x7FFFFFFF) s_seen[slot]++;
+	return s_sameSize > 120 && s_seen[slot] > 30;
+}
+
+static void VdSwapHook(void* buffer, void* fetch, void* a2, void* a3, void* a4,
+                       DWORD* front, DWORD* format, DWORD* colorSpace, DWORD* width, DWORD* height) {
+	InterlockedIncrement(&g_swapCount);
+	InterlockedIncrement(&g_hudFrames);
+	if (front) g_swapFront = *front;
+	if (format) g_swapFormat = *format;
+	if (width) g_swapWidth = *width;
+	if (height) g_swapHeight = *height;
+	if (fetch) memcpy((void*)g_swapFetch, fetch, sizeof(g_swapFetch));
+	((VdSwapFn)VdSwapDetour.GetOriginal<VdSwapFn>())(buffer, fetch, a2, a3, a4, front, format, colorSpace, width, height);
+	const bool settled = front && *front && width && height && FrontIsSettled(*front, *width, *height);
+	if (settled && (LONG)(GetTickCount() - g_hudUiQuietUntil) >= 0 &&
+		g_hudVisible && g_hudEnabled && g_hudGameReady && fetch &&
+		*width >= 640 && *width <= 1920 && *height >= 360 && *height <= 1080) {
+		// Not the scan-out buffer (register 7FC86110): writing there froze games a
+		// few menus in, 3 times out of 3 (2026-11-01).
+		if (g_hudDrawMode == 1) {
+			const DWORD prev = g_prevFront[0];
+			const bool rotation = prev && prev != *front && (g_prevFront[1] == *front || g_prevFront[2] == *front);
+			if (rotation && g_prevFetch0 == g_swapFetch[0] && g_prevFetch1 == g_swapFetch[1])
+				OverlayDraw(prev, g_swapFetch[0], g_swapFetch[1], g_swapFetch[3], *width, *height);
+		} else {
+			OverlayDraw(*front, g_swapFetch[0], g_swapFetch[1], g_swapFetch[3], *width, *height);
+		}
+	}
+	if (front && *front && fetch) {
+		g_prevFront[2] = g_prevFront[1]; g_prevFront[1] = g_prevFront[0]; g_prevFront[0] = *front;
+		g_prevFetch0 = g_swapFetch[0]; g_prevFetch1 = g_swapFetch[1];
+	}
+}
+
+// Polling thread, end of boot (the disk is mounted by then).
+static DWORD HudClamp(DWORD v, DWORD maxValue) { return v > maxValue ? maxValue : v; }
+
+// The limits keep every pixel inside 1280x720, whatever the file says.
+static void LoadOverlayLook() {
+	char path[128];
+	StudioPath(path, sizeof(path), "overlay_settings.txt");
+	std::ifstream in(path, std::ios::binary);
+	std::string line;
+	g_hudDrawMode = 0;   // test key: removing the line goes back to mode 0
+	while (in.is_open() && std::getline(in, line)) {
+		char name[16];
+		unsigned int v = 0;
+		if (sscanf(line.c_str(), "%15s %x", name, &v) != 2) continue;
+		if (!strcmp(name, "color_on")) g_hudColorOn = v & 0xFFFFFF;
+		else if (!strcmp(name, "color_off")) g_hudColorOff = v & 0xFFFFFF;
+		else if (!strcmp(name, "keys_x")) g_hudKeysX = HudClamp(v, 790);
+		else if (!strcmp(name, "keys_y")) g_hudKeysY = HudClamp(v, 590);
+		else if (!strcmp(name, "info_x")) g_hudInfoX = HudClamp(v, 1010);
+		else if (!strcmp(name, "info_y")) g_hudInfoY = HudClamp(v, 540);
+		else if (!strcmp(name, "info_always")) g_hudInfoAlways = v != 0;
+		else if (!strcmp(name, "style")) g_hudStyle = v != 0;
+		else if (!strcmp(name, "show_keys")) g_hudShowKeys = v != 0;
+		else if (!strcmp(name, "show_info")) g_hudShowInfo = v != 0;
+		else if (!strcmp(name, "show_pad")) g_hudShowPad = v != 0;
+		else if (!strcmp(name, "show_stats")) g_hudShowStats = v != 0;
+		else if (!strcmp(name, "draw_mode")) g_hudDrawMode = v == 1 ? 1 : 0;
+		else if (!strcmp(name, "info_secs")) g_hudInfoSecs = (v == 2 || v == 8) ? v : 4;
+		else if (!strcmp(name, "hotkey")) g_hudHotkey = (v & 0xFF) >= 0xE0 && (v & 0xFF) <= 0xE7 ? v & 0xFF : 0xE3;
+	}
+	StudioPath(path, sizeof(path), "disable_temps.txt");
+	g_hudNoTemps = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+	// The hook stays until the next boot once installed: this only stops the drawing.
+	StudioPath(path, sizeof(path), "enable_overlay.txt");
+	g_hudEnabled = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Boot freezes of 2026-11-05 and 11-06: both frozen boots stopped about 1 s after the
+// hook was installed at 14.6 s, while the boot animation was switching to Aurora. So
+// the hook now goes in at DllMain, before anything draws, and the files only say
+// whether to draw (g_hudEnabled). It costs one call per frame when the overlay is off.
+static void InstallVdSwapHook() {
+	void* vdSwap = nullptr;
+	HANDLE kernel = GetModuleHandleA("xboxkrnl.exe");
+	if (!kernel || XexGetProcedureAddress(kernel, 603, &vdSwap) != 0 || !vdSwap) {
+		FileLog("VdSwap not found - in-game display off");
+		return;
+	}
+	VdSwapDetour = Detour(vdSwap, (void*)VdSwapHook);
+	VdSwapDetour.Install();
+	g_overlayProbe = true;
+	FileLog("VdSwap hook on at %08x at load (in-game display)", (unsigned int)(uintptr_t)vdSwap);
+}
+
+// Black box (2026-11-12, FREEZE_STATIC_ANALYSIS.md). A total freeze may be the kernel's
+// own fatal path: VdDisplayFatalError ends by stopping every CPU. These two hooks save
+// the error code, the caller and the unflushed log lines to fatal_log.txt, then let the
+// kernel go on. Nothing here runs on a healthy console.
+extern "C" void* _ReturnAddress(void);
+#pragma intrinsic(_ReturnAddress)
+typedef void (*FatalErrorFn)(DWORD);
+typedef void (*BugCheckExFn)(DWORD, DWORD, DWORD, DWORD, DWORD);
+static Detour FatalErrorDetour;
+static Detour BugCheckExDetour;
+static char g_fatalLogPath[128];   // built at install: no path work on the dying path
+
+// The IRQL lives in the processor block (r13 + 0x18), as the kernel itself reads it.
+static __declspec(naked) DWORD CurrentIrql() {
+	__asm {
+		lbz r3, 0x18(r13)
+		blr
+	}
+}
+
+// Stack of the calling thread, from the processor block: base at r13 + 0x70, limit at + 0x74
+// (KPCR in xkelib's kePrivateStructs.h).
+static __declspec(naked) DWORD ThreadStackBase() {
+	__asm {
+		lwz r3, 0x70(r13)
+		blr
+	}
+}
+static __declspec(naked) DWORD ThreadStackLimit() {
+	__asm {
+		lwz r3, 0x74(r13)
+		blr
+	}
+}
+
+// How deep the polling thread's stack has ever gone: the unused part is filled with a
+// pattern once, at thread start, and the first changed word is the deepest point reached.
+static DWORD g_pollStackBase = 0, g_pollStackLimit = 0;
+static void PollStackPaint() {
+	volatile DWORD here = 0;
+	const DWORD sp = (DWORD)(uintptr_t)&here;
+	const DWORD base = ThreadStackBase(), limit = ThreadStackLimit();
+	g_pollStackBase = base;
+	if (limit == 0 || limit >= sp || base <= sp || base - limit > 0x100000) return;   // not what we expect: paint nothing
+	for (DWORD* q = (DWORD*)(uintptr_t)limit; (DWORD)(uintptr_t)q + 0x400 < sp; q++) *q = 0xA5A5A5A5;
+	g_pollStackLimit = limit;
+}
+static DWORD PollStackDeepest() {
+	if (!g_pollStackLimit) return 0;
+	const DWORD* q = (const DWORD*)(uintptr_t)g_pollStackLimit;
+	while ((DWORD)(uintptr_t)q < g_pollStackBase && *q == 0xA5A5A5A5) q++;
+	return g_pollStackBase - (DWORD)(uintptr_t)q;
+}
+
+static void BlackBoxSave(const char* what, DWORD code, DWORD p1, DWORD p2, void* caller) {
+	static volatile LONG saved = 0;
+	const DWORD irql = CurrentIrql();
+	// File I/O is only allowed below DISPATCH level; above it the record is lost.
+	if (irql >= 2 || InterlockedExchange(&saved, 1)) return;
+	char line[200];
+	int n = _snprintf(line, sizeof(line) - 1,
+		"[%ums] %hs code=%08x p1=%08x p2=%08x caller=%08x irql=%u title=%08x plugin=%hs\r\n",
+		(unsigned int)GetTickCount(), what, (unsigned int)code, (unsigned int)p1, (unsigned int)p2,
+		(unsigned int)(uintptr_t)caller, (unsigned int)irql, (unsigned int)g_lastTitleId, X360REMAP_VERSION);
+	if (n < 0) n = sizeof(line) - 1;
+	HANDLE f = CreateFileA(g_fatalLogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE) return;
+	SetFilePointer(f, 0, NULL, FILE_END);
+	DWORD done = 0;
+	WriteFile(f, line, (DWORD)n, &done, NULL);
+	int len = g_logBufferLen;   // the lines that never reached the disk
+	if (len > 0 && len <= LOG_BUFFER_SIZE) WriteFile(f, g_logBuffer, (DWORD)len, &done, NULL);
+	FlushFileBuffers(f);
+	CloseHandle(f);
+}
+
+static void FatalErrorHook(DWORD code) {
+	BlackBoxSave("VdDisplayFatalError", code, 0, 0, _ReturnAddress());
+	FatalErrorDetour.GetOriginal<FatalErrorFn>()(code);
+}
+
+static void BugCheckExHook(DWORD code, DWORD p1, DWORD p2, DWORD p3, DWORD p4) {
+	BlackBoxSave("KeBugCheckEx", code, p1, p2, _ReturnAddress());
+	BugCheckExDetour.GetOriginal<BugCheckExFn>()(code, p1, p2, p3, p4);
+}
+
+static void InstallBlackBox() {
+	StudioPath(g_fatalLogPath, sizeof(g_fatalLogPath), "fatal_log.txt");
+	void* fatal = nullptr;
+	void* bugCheck = nullptr;
+	HANDLE kernel = GetModuleHandleA("xboxkrnl.exe");
+	if (!kernel) return;
+	if (XexGetProcedureAddress(kernel, 434, &fatal) == 0 && fatal) {
+		FatalErrorDetour = Detour(fatal, (void*)FatalErrorHook);
+		FatalErrorDetour.Install();
+	}
+	if (XexGetProcedureAddress(kernel, 83, &bugCheck) == 0 && bugCheck) {
+		BugCheckExDetour = Detour(bugCheck, (void*)BugCheckExHook);
+		BugCheckExDetour.Install();
+	}
+	FileLog("Black box on: VdDisplayFatalError %08x, KeBugCheckEx %08x -> fatal_log.txt",
+		(unsigned int)(uintptr_t)fatal, (unsigned int)(uintptr_t)bugCheck);
+}
+
+static void LoadOverlaySetting() {
+	LoadOverlayLook();
+	FileLog("In-game display %hs (enable_overlay.txt)", g_hudEnabled ? "on" : "off");
+}
+
+static void LogOverlayProbe(uint32_t title) {
+	static DWORD s_last = 0;
+	const DWORD now = GetTickCount();
+	if (!g_overlayProbe || !g_hudEnabled || (now - s_last) < 5000) return;
+	const DWORD elapsed = now - s_last;
+	s_last = now;
+	const LONG frames = InterlockedExchange(&g_swapCount, 0);
+	FileLog("Overlay probe: %u frames/s title=%08x front=%08x format=%08x %ux%u fetch %08x %08x %08x %08x %08x %08x",
+		(unsigned int)(frames * 1000 / (LONG)elapsed), (unsigned int)title, (unsigned int)g_swapFront,
+		(unsigned int)g_swapFormat, (unsigned int)g_swapWidth, (unsigned int)g_swapHeight,
+		(unsigned int)g_swapFetch[0], (unsigned int)g_swapFetch[1], (unsigned int)g_swapFetch[2],
+		(unsigned int)g_swapFetch[3], (unsigned int)g_swapFetch[4], (unsigned int)g_swapFetch[5]);
+}
+
+static void LoadFreezeTestSettings() {
+	char path[128];
+	StudioPath(path, sizeof(path), "disable_defer_report_free.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_deferReportFree = false; }
+	}
+	StudioPath(path, sizeof(path), "enable_interrupt_status_check.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_interruptStatusCheck = true; }
+	}
+	StudioPath(path, sizeof(path), "disable_clean_unplug.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_cleanUnplug = false; FileLog("disable_clean_unplug.txt found - old unplug path"); }
+	}
+	StudioPath(path, sizeof(path), "enable_stick_release_ramp.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_stickReleaseRamp = true; FileLog("enable_stick_release_ramp.txt found - left stick release ramp ON"); }
+	}
+	StudioPath(path, sizeof(path), "enable_packet_on_change.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_packetOnChange = true; FileLog("enable_packet_on_change.txt found - packet number only changes with the state"); }
+	}
+	StudioPath(path, sizeof(path), "disable_stick_rest_noise.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_stickRestNoise = false; FileLog("disable_stick_rest_noise.txt found - left stick can be exactly 0"); }
+	}
+	StudioPath(path, sizeof(path), "enable_input_trace.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in.is_open()) { in.close(); g_inputTrace = true; FileLog("enable_input_trace.txt found - input trace ON"); }
+	}
+	StudioPath(path, sizeof(path), "players_merged.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		g_playersSeparate = !in.is_open();
+		if (in.is_open()) in.close();
+		FileLog("Players mode: %hs", g_playersSeparate ? "separate, keyboard / mouse = player 1 (default)" : "merged (players_merged.txt)");
+	}
+	StudioPath(path, sizeof(path), "disable_generic_hid.txt");
+	{
+		std::ifstream in(path, std::ios::binary);
+		g_disableGenericHid = in.is_open();
+		if (in.is_open()) { in.close(); FileLog("disable_generic_hid.txt found - non-boot HID devices left to the console"); }
+	}
+	// Also written to its own small file, straight away: the first lines of the
+	// plugin log are often lost at boot (log buffer full before the first flush).
+	{
+		char sp[128];
+		StudioPath(sp, sizeof(sp), "X360Remap_switches.txt");
+		std::ofstream o(sp, std::ios::binary | std::ios::trunc);
+		if (o.is_open()) {
+			o << "X360Remap switches read at boot\r\n";
+			o << "deferred report free: " << (g_deferReportFree ? "ON" : "OFF") << "\r\n";
+			o << "interrupt status check: " << (g_interruptStatusCheck ? "ON" : "OFF") << "\r\n";
+			o << "stick release ramp: " << (g_stickReleaseRamp ? "ON" : "OFF") << "\r\n";
+			o << "packet on change: " << (g_packetOnChange ? "ON" : "OFF") << "\r\n";
+			o << "stick rest noise: " << (g_stickRestNoise ? "ON" : "OFF") << "\r\n";
+			o << "input trace: " << (g_inputTrace ? "ON" : "OFF") << "\r\n";
+			o << "clean unplug: " << (g_cleanUnplug ? "ON" : "OFF") << "\r\n";
+			o << "players: " << (g_playersSeparate ? "separate" : "merged") << "\r\n";
+			o << "generic HID: " << (g_disableGenericHid ? "OFF (disable_generic_hid.txt)" : "ON") << "\r\n";
+		}
+	}
+	FileLog("Freeze test switches: deferred report free %hs, interrupt status check %hs",
+		g_deferReportFree ? "ON" : "OFF (disable_defer_report_free.txt)",
+		g_interruptStatusCheck ? "ON (enable_interrupt_status_check.txt)" : "OFF");
+}
+
 static void LoadNotificationSetting() {
 	char path[128];
 	StudioPath(path, sizeof(path), "disable_notifications.txt");
@@ -404,13 +1298,56 @@ void FlushLogBuffer() {
 	// de flush, elle doit rester la plus simple possible.
 	char logPath[128];
 	StudioPath(logPath, sizeof(logPath), "X360Remap_plugin.log");
+
+	// Keep the PREVIOUS session (2026-10-11, tester report: after a freeze
+	// the only way out is to power off, and the next boot erased the log of
+	// the session that froze). Before the first truncation of this boot, the
+	// old log (its last 256 KB) is copied to X360Remap_plugin_previous.log.
+	if (!g_logTruncatedThisBoot) {
+		std::ifstream old(logPath, std::ios::binary);
+		if (old.is_open()) {
+			old.seekg(0, std::ios::end);
+			std::streamoff size = old.tellg();
+			const std::streamoff keep = 256 * 1024;
+			std::streamoff from = size > keep ? size - keep : 0;
+			if (size > 0) {
+				char* buf = (char*)malloc((size_t)(size - from));
+				if (buf) {
+					old.seekg(from, std::ios::beg);
+					old.read(buf, size - from);
+					const std::streamsize got = old.gcount();
+					old.close();
+					char prevPath[128];
+					StudioPath(prevPath, sizeof(prevPath), "X360Remap_plugin_previous.log");
+					std::ofstream prev(prevPath, std::ios::binary | std::ios::trunc);
+					if (prev.is_open()) prev.write(buf, got);
+					free(buf);
+				}
+			}
+		}
+	}
+
 	std::ofstream file(logPath, mode);
 	if (file.is_open()) {
 		file.write(g_logBuffer, len);
 		g_logTruncatedThisBoot = true;
+	} else {
+		// Disk not ready yet (early boot): KEEP the lines for the next flush
+		// (2026-10-14, HB log: the version line and everything before 4.8 s
+		// were missing - they were thrown away when this write failed).
+		// FileLog drops new lines if the buffer fills up meanwhile.
+		return;
 	}
 #endif
-	g_logBufferLen = 0;
+	// Keep the lines written WHILE the disk write was running (2026-10-11,
+	// tester log: every "HidAddDevice" line of the re-enumeration was missing -
+	// USB callbacks logged during the flush and the old "= 0" erased them).
+	{
+		const int now = g_logBufferLen;
+		const int extra = now > len ? now - len : 0;
+		if (extra > 0) memmove(g_logBuffer, g_logBuffer + len, extra);
+		g_logBufferLen = extra;
+	}
 }
 
 // Une etape d'initialisation franchie : ecrite ET poussee sur le disque
@@ -470,6 +1407,20 @@ struct __declspec(align(2)) HidControllerExtension
 	unsigned __int8 deviceType;
 	BYTE alwaysZeroThree;
 	BYTE alwaysZeroFour;
+
+	// --- Clean unplug (2026-10-12), appended: only our code uses these ---
+	// Recipe from usb-audio-x360 (TimeoutTim, GPL-3.0-or-later,
+	// docs/xbox-usb-transport-contract.md, validated on retail 17559): a close
+	// request is a SEPARATE object with the transfer-block layout (endpoint,
+	// callback, saved endpoint, link...). We used to pass our own interruptTrb /
+	// controlTrb to the close functions: the kernel then linked a live
+	// transfer block into its close list and called back its old completion
+	// routine - the freezes of test 1/3 and the random unplug freezes.
+	UsbTrb closeReq[2];             // [0] interrupt endpoint, [1] default endpoint
+	DWORD openedDataEp;             // endpoint handles saved right after opening
+	DWORD openedDefaultEp;
+	volatile LONG closePending;     // close callbacks still expected
+	volatile DWORD closeDoneAt;     // tick when the last one arrived (0 = not yet)
 };
 
 struct deviceHandle {
@@ -536,6 +1487,24 @@ static void QueueDriverFree(HidControllerExtension* drv) {
 	FileLog("Deferred free: queue full, driver %p deliberately not freed", drv);
 }
 
+// Same delay for the report buffer the USB stack writes packets into
+// (see g_deferReportFree). Queue full = deliberately leaked, never freed early.
+static void* volatile g_pendingBufferFree[PENDING_FREE_SLOTS];
+static DWORD g_pendingBufferFreeAt[PENDING_FREE_SLOTS];
+
+static void QueueBufferFree(void* buf) {
+	if (!buf) return;
+	for (int i = 0; i < PENDING_FREE_SLOTS; i++) {
+		if (!g_pendingBufferFree[i]) {
+			g_pendingBufferFreeAt[i] = GetTickCount() + PENDING_FREE_DELAY_MS;
+			MemoryBarrier();
+			g_pendingBufferFree[i] = buf;   // written LAST, same rule as QueueDriverFree
+			return;
+		}
+	}
+	FileLog("Deferred free: buffer queue full, report buffer %p deliberately not freed", buf);
+}
+
 // Appelee uniquement depuis MappingManagerThreadProc (contexte sur), jamais
 // depuis un callback USB.
 static void DrainDriverFreeQueue() {
@@ -546,8 +1515,28 @@ static void DrainDriverFreeQueue() {
 		MemoryBarrier();   // lecture de freeAtMs APRES celle de drv (AUDIT C3)
 		// Comparaison signee : resiste au debordement de GetTickCount().
 		if ((int)(now - g_pendingDriverFree[i].freeAtMs) < 0) continue;
+		// Clean unplug: never free while the kernel still owes us a close
+		// callback, and leave it 1 s more after the last one (usb-audio-x360's
+		// settle time). No answer after 30 s: leak it on purpose, never free early.
+		if (drv->closePending > 0) {
+			if ((int)(now - g_pendingDriverFree[i].freeAtMs) > 30000) {
+				g_pendingDriverFree[i].drv = nullptr;
+				FileLog("Clean unplug: close callbacks missing after 30 s - driver %p kept (not freed)", drv);
+			}
+			continue;
+		}
+		if (drv->closeDoneAt && (int)(now - drv->closeDoneAt) < 1000) continue;
 		g_pendingDriverFree[i].drv = nullptr;
+		if (drv->closeDoneAt) FileLog("Clean unplug: all close callbacks received, driver %p freed", drv);
 		delete drv;
+	}
+	for (int i = 0; i < PENDING_FREE_SLOTS; i++) {
+		void* buf = g_pendingBufferFree[i];
+		if (!buf) continue;
+		MemoryBarrier();
+		if ((int)(now - g_pendingBufferFreeAt[i]) < 0) continue;
+		g_pendingBufferFree[i] = nullptr;
+		free(buf);
 	}
 }
 
@@ -654,6 +1643,22 @@ volatile bool g_configUnreadable = false;
 // plugged much later (16s+ in every capture so far), so a 10s blackout covers
 // boot enumeration without interfering with normal hot-plugging.
 #define BOOT_CLAIM_BLACKOUT_MS 10000
+// Boot freezes of 2026-11-09 (3 logs, with and without the VdSwap hook, with and
+// without NetIsoCapture): every frozen boot stopped within a second of the end of
+// the blackout, which re-reads every setting and loaded X360Remap.json a second
+// time, while Aurora was making its first XamInput calls through our hooks. The
+// end of the blackout now waits until Aurora has been reading the pads for 8 s
+// (or 45 s after load if it never does), out of its start-up window.
+#define BOOT_SETTLE_AFTER_INPUT_MS 8000
+#define BOOT_SETTLE_MAX_MS 45000
+// 2026-11-12: the freeze followed that 8 s timer (15 s, then 22 s and 25.8 s), always while
+// Aurora was still loading (6 to 14 frames/s). The end of the blackout (a burst of file reads)
+// now waits until the dashboard title has been up for 13 s, when Aurora is idle at 59 frames/s,
+// and the USB reset follows 3 s later. FREEZE_STATIC_ANALYSIS.md.
+#define BOOT_SETTLE_TITLE_MS 13000
+extern DWORD g_titleStableSince;
+static DWORD g_blackoutEndedAt = 0;
+volatile DWORD g_firstXamInputTick = 0;   // set once by the XamInput hooks (a plain store)
 
 #define USB_ENDPOINT_TYPE_CONTROL     0x00
 #define USB_ENDPOINT_TYPE_ISOCHRONOUS 0x01
@@ -808,6 +1813,8 @@ struct Controller {
 	deviceHandle* deviceHandle;
 	HidControllerExtension* controllerDriver;
 	ButtonsReport currentState;
+	MacroPlay macroPlay[MAX_MACROS];   // game thread only (XInputdReadStateHook)
+	bool padListed;                    // USB pad written to known_devices.txt (polling thread)
 	uint8_t userIndex;
 	uint32_t deviceContext;
 	uint16_t vendorId;
@@ -899,6 +1906,7 @@ struct Controller {
 	uint16_t reportDescLen;            // longueur demandee/recue
 	volatile bool reportDescReady;     // pose par le callback USB, lu par le thread de polling
 	volatile bool reportDescFailed;    // une des deux etapes a echoue -> on reste en mode boot
+	volatile bool reportProtocolRequested; // SET_PROTOCOL(report) sent (descriptor uses Report IDs)
 	bool     reportDescParsed;         // deja traite par le thread de polling (une seule fois)
 	DWORD    reportDescRequestedMs;    // pour le delai de repli
 
@@ -939,6 +1947,28 @@ struct Controller {
 	bool isBootProtocol;
 	uint16_t reportSize;   // interrupt endpoint packet size, to know if a mouse sends a wheel byte
 
+	// Extra keyboard interface of a gaming keyboard / keypad (2026-10-11).
+	// Razer (Tartarus V2 1532:022B: interface 0 = boot keyboard, 8 bytes;
+	// interface 1 = keyboard, NO boot subclass, 16 bytes; interface 2 = mouse),
+	// Corsair, Logitech, SteelSeries... expose a second "keyboard" interface
+	// that sends N-key-rollover reports (report ID + one BIT per key). Its
+	// layout is NOT the 8-byte boot layout: decoding it as boot gave wrong
+	// keys, a phantom Ctrl (the report ID byte read as modifiers) and
+	// overwrote the good state of interface 0 on the same player.
+	// Fix: the boot interface is put in boot protocol (SET_PROTOCOL, what the
+	// Xbox dashboard, a PC BIOS and KVM switches do - the device then sends
+	// every key there), and the extra interface is kept claimed but never
+	// decoded. Its first reports are logged in hex so a new layout can be
+	// studied from a tester's log.
+	bool isExtraKeyboardIf;
+	uint8_t extraIfLogged;
+	// Raw key reports captured in the USB callback, LOGGED BY THE POLLING
+	// THREAD (2026-10-12: calling FileLog / _snprintf from the USB completion
+	// froze the console after 1-3 key presses - CRT code is not safe there).
+	uint8_t keyRaw[8][16];
+	volatile uint8_t keyRawCount;     // written by the USB callback only
+	uint8_t keyRawLogged;             // read/written by the polling thread only
+
 	// --- Keyboard+mouse fusion (2026-07-31) ---
 	// All boot-protocol devices share ONE XAM registration, so the system sees
 	// a single player instead of one per device. Each still needs its own
@@ -962,6 +1992,7 @@ struct Controller {
 	// ARCHITECTURE.md for why application.xex needs this instead of reading
 	// the USB device itself.
 	volatile uint8_t lastKeyCode;
+	volatile uint8_t lastModifiers;   // HID modifier byte (Ctrl/Shift/Alt/Win), for the Win+Shift+X switch
 	volatile uint8_t lastMouseButtonIdx;
 	// Full raw button bitmask (bit0=left/bit1=right/bit2=middle/... per HID
 	// boot-mouse convention), added 2026-08-01 for application.xex's mouse
@@ -1006,6 +2037,11 @@ struct Controller {
 	// Lissage temporel (2026-09-26, voir HidDeviceMapping::smoothingMs).
 	// Thread du jeu uniquement. Remis a zero avec le reste au retrait.
 	SmoothingState smooth;
+	SmoothingState smoothAim;   // direct aim smoothing (directAimSmoothingMs), separate from the stick's
+	GimxState gimx;             // GIMX method state (1.4.2), game thread only
+	DWORD gimxLastMs;           // time of the previous GIMX poll
+	float adsFactor;            // current direct-aim speed factor (1 = hip), ramps to adsSensitivity
+	DWORD adsLastMs;
 } __declspec(align(4));
 
 struct MappingState {
@@ -1102,6 +2138,59 @@ volatile int32_t  g_liveAdz  = -1;         // -1 = pas de surcharge
 volatile int32_t  g_liveAdzY = -1;         // -1 = pas de surcharge
 volatile int32_t  g_liveSm   = -1;         // -1 = pas de surcharge
 volatile uint32_t g_liveTitle = 0;         // jeu concerne (0 = aucune surcharge active)
+
+// --- On/off switch: Win + Shift + X (2026-10-08, HB) ------------------------
+// Pauses X360Remap WITHOUT unplugging anything: keyboard and mouse stop
+// driving player 1, and the REAL controller's input is copied into player 1
+// instead (the virtual controller keeps its slot, so the game - which only
+// listens to player 1 - now hears the pad). Same keys again: back on.
+// Read in the polling thread from the keyboard's HID modifier byte.
+volatile bool g_remapPaused = false;
+const uint8_t PAUSE_KEY_X = 0x1B;           // HID usage of X
+// Same combo as Win+Shift+X (rgdshock, issue 7): D = direct aim off / on for the
+// running game (back on at the next game), R = reload X360Remap.json and the
+// learned cameras, for when the mouse starts acting like the left stick.
+const uint8_t AIM_KEY_D = 0x07, RELOAD_KEY_R = 0x15;
+static volatile bool g_directAimOff = false;
+// Last state of the real controller, refreshed (1) by the game itself each
+// time it reads the pad (end of XInputdReadStateHook) and (2) every 100 ms by
+// the polling thread. Never read with XInputGetState from inside the hook:
+// the game may already hold XInput's lock there.
+XINPUT_GAMEPAD    g_realPad;
+volatile DWORD    g_realPadTick = 0;
+// Separate players: the pad that held player 1 before the keyboard / mouse took
+// its place. Written where player 1 is read, played back on the keyboard / mouse
+// slot (which becomes that pad's player).
+XINPUT_GAMEPAD    g_displacedPad;
+
+// Merged players (see g_playersSeparate). Set while the real-controller
+// branch of XInputdReadStateHook reads the keyboard / mouse slot itself.
+volatile bool     g_mergeInternalRead = false;
+volatile DWORD    g_mergeDeliveredTick = 0; // last time the pad received the keyboard / mouse
+// Last time the keyboard / mouse slot (player 1) received the real pad's input
+// (merged players, pad on another slot). The pad's own slot then rests, or
+// Aurora / games see every pad press twice (2026-10-29, HB: the D-pad skipped
+// one tile in Aurora when the Rapoo dongle took player 1 before the pad).
+volatile DWORD    g_padIntoKbmTick = 0;
+// Guide button asked by a keyboard / mouse key: user index + 1, 0 = none.
+// Set in XInputdReadStateHook, sent by the polling thread (XAM call).
+volatile LONG     g_guideRequest = 0;
+volatile bool     g_pollRealRead = false;   // ReadRealControllerState is reading (polling thread)
+const uint8_t     PLAYERS_KEY = 0x47;       // HID usage of Scroll Lock
+
+// Both pads into dst: buttons OR-ed, each trigger the larger, each stick
+// the one pushed further (so a resting stick never cancels the other).
+static void MergeGamepad(XINPUT_GAMEPAD* dst, const XINPUT_GAMEPAD* src) {
+	dst->wButtons |= src->wButtons;
+	if (src->bLeftTrigger > dst->bLeftTrigger) dst->bLeftTrigger = src->bLeftTrigger;
+	if (src->bRightTrigger > dst->bRightTrigger) dst->bRightTrigger = src->bRightTrigger;
+	const uint32_t dl = (uint32_t)((int32_t)dst->sThumbLX * dst->sThumbLX) + (uint32_t)((int32_t)dst->sThumbLY * dst->sThumbLY);
+	const uint32_t sl = (uint32_t)((int32_t)src->sThumbLX * src->sThumbLX) + (uint32_t)((int32_t)src->sThumbLY * src->sThumbLY);
+	if (sl > dl) { dst->sThumbLX = src->sThumbLX; dst->sThumbLY = src->sThumbLY; }
+	const uint32_t dr = (uint32_t)((int32_t)dst->sThumbRX * dst->sThumbRX) + (uint32_t)((int32_t)dst->sThumbRY * dst->sThumbRY);
+	const uint32_t sr = (uint32_t)((int32_t)src->sThumbRX * src->sThumbRX) + (uint32_t)((int32_t)src->sThumbRY * src->sThumbRY);
+	if (sr > dr) { dst->sThumbRX = src->sThumbRX; dst->sThumbRY = src->sThumbRY; }
+}
 // Etat du polling uniquement (un seul thread) :
 int      g_liveHeldKey = -1, g_liveHeldTicks = 0;
 bool     g_liveDirty = false, g_liveNotifyPending = false;
@@ -1170,6 +2259,8 @@ volatile bool g_mousehookNotifyPending = false;
 
 static bool AddrOk(uint32_t a) { return a != 0 && MmIsAddressValid((PVOID)a) != FALSE; }
 
+static void LogRunningGameVersion(uint32_t titleId);   // defined after GetTitleVersion
+
 // Cherche la version en cours (une fois par titre). -1 = non reconnue.
 static int FindCodBuild(uint32_t titleId) {
 	static uint32_t s_title = 0xFFFFFFFF;
@@ -1204,10 +2295,12 @@ static int FindCodBuild(uint32_t titleId) {
 					ok ? (unsigned int)*(volatile uint32_t*)kCodBuilds[i].sigAddr : 0u,
 					ok ? "" : " (invalid address)");
 			}
+			LogRunningGameVersion(titleId);
 		}
 	}
 	return s_build;
 }
+
 
 // true = mouvement applique a la camera (ne PAS l'envoyer aussi au stick).
 static bool MouseHookCod(uint32_t titleId, int32_t dx, int32_t dy, int32_t sensitivity, bool invertY) {
@@ -1258,6 +2351,1110 @@ static bool MouseHookCod(uint32_t titleId, int32_t dx, int32_t dy, int32_t sensi
 	return false;
 #endif
 }
+
+// ============================================================================
+// CAMERA AUTO-DETECTION FOR DIRECT AIM (v1.2.1, 2026-10-03)
+//
+// Hold F12 in game: the plugin turns the camera by itself through the right
+// stick, finds the float(s) that follow it in the game's writable sections,
+// lets the player confirm (F12 = keep, Backspace = next candidate), and saves
+// the result to X360RemapStudio\camera_addresses.txt - one line per game
+// version, easy to share. The pure logic (filters, ranking, file format,
+// PE parsing) is in camera_learn.cpp and tested with g++.
+//
+// Threads:
+//   - polling thread (MappingManagerThreadProc): keys, notifications, start;
+//   - learning thread (CameraLearnThreadProc): the search itself, Sleep-based;
+//   - game thread (XInputdReadStateHook): writes the injected stick, applies
+//     learned cameras. Shared state = aligned 32-bit values + MemoryBarrier,
+//     same rules as the rest of this file.
+//
+// Limits (see PLAN_v1.2.1.md): fixed addresses only (cameras inside the
+// executable's data). Offline only, like all direct aim.
+// ============================================================================
+#define EN_CAMERA_LEARN 1
+
+const uint8_t LEARN_KEY_START  = 0x45;   // F12: hold ~1.5 s to start, tap to accept
+const uint8_t LEARN_KEY_NEXT   = 0x2A;   // Backspace: next candidate / cancel
+const int     LEARN_HOLD_TICKS = 15;     // ~1.5 s at 100 ms per polling tick
+const int32_t LEARN_STICK      = 32000;  // push strength
+
+enum LearnState { LEARN_IDLE = 0, LEARN_RUNNING = 1, LEARN_CONFIRM = 2 };
+volatile int32_t  g_learnState = LEARN_IDLE;
+volatile int32_t  g_learnInject = 0;     // 1 = the hook writes g_learnRX/RY into the right stick
+volatile int32_t  g_learnRX = 0, g_learnRY = 0;
+volatile uint32_t g_learnHookTick = 0;   // last time the hook applied the injection
+volatile int32_t  g_learnAbort = 0;      // set by the polling thread (Backspace, game change)
+volatile int32_t  g_learnAnswer = 0;     // CONFIRM: 1 = keep, 2 = next
+volatile uint32_t g_learnTitle = 0;
+volatile int32_t  g_learnMsgPending = 0; // notification text prepared by the learning thread
+wchar_t           g_learnMsg[160];
+
+const int MAX_LEARNED_CAMERAS = 96;   // file lines + the built-in list (camera_known.cpp)
+LearnedCamera     g_learned[MAX_LEARNED_CAMERAS];
+volatile int32_t  g_learnedCount = 0;
+LearnedCamera     g_learnTest;           // candidate being tried while waiting for the answer
+volatile int32_t  g_learnTestActive = 0;
+volatile int32_t  g_learnedNotifyIdx = -1;      // learned camera recognized: notify once
+volatile int32_t  g_learnedActiveIdx = -1;      // learned camera in use (status file), see MouseHookLearned
+volatile DWORD    g_learnedActiveTick = 0;
+volatile int32_t  g_learnedNotifyPending = 0;
+
+// The running game's executable: base, size, build stamp, PE header.
+static bool GetTitleImage(uint32_t* base, uint32_t* size, uint32_t* stamp, uint8_t** nt) {
+	__try {
+		if (!XexExecutableModuleHandle) return false;
+		PLDR_DATA_TABLE_ENTRY e = *XexExecutableModuleHandle;
+		if (!e || !MmIsAddressValid(e)) return false;
+		*base = (uint32_t)e->ImageBase;
+		*size = (uint32_t)e->SizeOfFullImage;
+		*stamp = (uint32_t)e->TimeDateStamp;
+		*nt = (uint8_t*)e->NtHeadersBase;
+		return *base != 0 && *size != 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+// Executable version from the XEX header (v3 lines are matched on it, like
+// Xenia Mousehook does). 0 if unknown.
+static uint32_t GetTitleVersion() {
+	__try {
+		if (!XexExecutableModuleHandle) return 0;
+		PLDR_DATA_TABLE_ENTRY e = *XexExecutableModuleHandle;
+		if (!e || !MmIsAddressValid(e) || !e->XexHeaderBase) return 0;
+		PXEX_EXECUTION_ID id = (PXEX_EXECUTION_ID)RtlImageXexHeaderField(e->XexHeaderBase, XEX_HEADER_EXECUTION_ID);
+		if (!id || !MmIsAddressValid(id)) return 0;
+		return (uint32_t)id->Version;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
+// Which exact version of the game is running (2026-10-12): needed to add a
+// title update to direct aim. The version is the XEX one (major.minor.build.qfe,
+// what Xenia shows as "vX.X.X.X"); build stamp + size identify the executable.
+static void LogRunningGameVersion(uint32_t titleId) {
+	uint32_t base = 0, size = 0, stamp = 0; uint8_t* nt = 0;
+	if (!GetTitleImage(&base, &size, &stamp, &nt)) {
+		FileLog("Game %08x: executable not readable", (unsigned int)titleId);
+		return;
+	}
+	const uint32_t v = GetTitleVersion();
+	FileLog("Game %08x: version %u.%u.%u.%u, build stamp %08x, image %08x size %08x",
+		(unsigned int)titleId, (unsigned)(v >> 28), (unsigned)((v >> 24) & 0xF),
+		(unsigned)((v >> 8) & 0xFFFF), (unsigned)(v & 0xFF),
+		(unsigned int)stamp, (unsigned int)base, (unsigned int)size);
+}
+
+static void LearnedCamerasPath(char* out, int outSize) {
+	StudioPath(out, outSize, "camera_addresses.txt");
+}
+
+// Reads camera_addresses.txt. Called at boot (DllMain) and after a save.
+static void LoadLearnedCameras() {
+	char path[128];
+	LearnedCamerasPath(path, sizeof(path));
+	static LearnedCamera tmp[MAX_LEARNED_CAMERAS];
+	int n = 0;
+	std::ifstream in(path, std::ios::binary);
+	if (in.is_open()) {
+		std::string line;
+		while (n < MAX_LEARNED_CAMERAS && std::getline(in, line)) {
+			LearnedCamera e;
+			if (CamParseLine(line.c_str(), &e)) tmp[n++] = e;
+		}
+		in.close();
+	}
+	const int fromFile = n;
+	// Then the built-in list (camera_known.cpp). A line from the file for the
+	// same game version comes first and therefore wins.
+	for (size_t k = 0; k < kCamKnownCount && n < MAX_LEARNED_CAMERAS; k++) {
+		LearnedCamera e;
+		if (CamParseLine(kCamKnownLines[k], &e)) tmp[n++] = e;
+	}
+	g_learnedCount = 0;           // readers see "nothing" while the table is rewritten
+	MemoryBarrier();
+	for (int i = 0; i < n; i++) g_learned[i] = tmp[i];
+	MemoryBarrier();
+	g_learnedCount = n;
+	FileLog("Learned cameras: %d from camera_addresses.txt, %d built in", fromFile, n - fromFile);
+}
+
+// Adds or replaces one entry (same game AND same build), rewrites the file.
+static bool SaveLearnedCamera(const LearnedCamera& e) {
+	char path[128];
+	LearnedCamerasPath(path, sizeof(path));
+	std::vector<std::string> keep;
+	{
+		std::ifstream in(path, std::ios::binary);
+		std::string line;
+		while (in.is_open() && std::getline(in, line)) {
+			LearnedCamera old;
+			if (!CamParseLine(line.c_str(), &old)) continue;   // comments are rewritten below
+			if (old.titleId == e.titleId && old.timeStamp == e.timeStamp && old.imageSize == e.imageSize) continue;
+			keep.push_back(line);
+		}
+	}
+	char newLine[160];
+	if (CamFormatLine(e, newLine, sizeof(newLine)) <= 0) return false;
+	std::ofstream out(path, std::ios::binary | std::ios::trunc);
+	if (!out.is_open()) return false;
+	out << "# X360Remap - learned cameras for direct aim (one line per game version).\n";
+	out << "# titleId buildStamp imageSize yawAddr pitchAddr signX signY unit name\n";
+	out << "# Share this file: another player with the same game version can use it as is.\n";
+	for (size_t i = 0; i < keep.size(); i++) out << keep[i] << "\n";
+	out << newLine << "\n";
+	out.close();
+	return true;
+}
+
+// Learned camera for the running build, -1 if none (re-checked every 3 s:
+// solo and multiplayer are two executables under the same Title ID).
+static int FindLearnedCamera(uint32_t titleId) {
+	static uint32_t s_title = 0xFFFFFFFF;
+	static int s_idx = -1;
+	static DWORD s_at = 0;
+	static int32_t s_count = -1;
+	const DWORD now = GetTickCount();
+	const int32_t count = g_learnedCount;
+	if (titleId == s_title && count == s_count && (now - s_at) < 3000) return s_idx;
+	s_title = titleId; s_at = now; s_count = count; s_idx = -1;
+	if (count <= 0) return -1;
+	uint32_t base = 0, size = 0, stamp = 0; uint8_t* nt = 0;
+	if (!GetTitleImage(&base, &size, &stamp, &nt)) return -1;
+	const uint32_t version = GetTitleVersion();
+	MemoryBarrier();
+	for (int i = 0; i < count && i < MAX_LEARNED_CAMERAS; i++) {
+		const LearnedCamera& e = g_learned[i];
+		// Build stamp lines (imageSize 0 = any size) or version lines - see CamMatches.
+		if (CamMatches(e, titleId, stamp, size, version)) { s_idx = i; break; }
+	}
+	return s_idx;
+}
+
+// Memory reader for CamResolve (game thread and learning thread).
+static bool LearnRead32Cb(uint32_t addr, uint32_t* out, void*) {
+	if (!AddrOk(addr) || (addr & 3)) return false;
+	*out = *(volatile uint32_t*)addr;
+	return true;
+}
+
+// Direct aim through a learned camera. 0 = not handled, 1 = both axes
+// handled, 2 = only horizontal (no pitch learned: vertical stays on the stick).
+static int MouseHookLearned(uint32_t titleId, int32_t dx, int32_t dy, int32_t sensitivity, bool invertY) {
+#if EN_CAMERA_LEARN
+	if (titleId == 0 || g_learnInject) return 0;
+	const LearnedCamera* e = 0;
+	// 1 = candidate being tried, 2 = found for this session only (no permanent address)
+	if (g_learnTestActive && g_learnTitle == titleId) {
+		MemoryBarrier();
+		e = &g_learnTest;
+	} else {
+		static int s_prev = -1;
+		const int i = FindLearnedCamera(titleId);
+		if (i != s_prev) {
+			s_prev = i;
+			if (i >= 0) { g_learnedNotifyIdx = i; MemoryBarrier(); g_learnedNotifyPending = 1; }
+		}
+		if (i < 0) return 0;
+		e = &g_learned[i];
+		g_learnedActiveIdx = i;
+		g_learnedActiveTick = GetTickCount();
+	}
+	// v3: follows the pointers of the learned entry (cameras inside objects
+	// allocated by the game). Null pointer = menus / loading: stick as usual.
+	uint32_t yawA = 0, pitchA = 0;
+	if (!CamResolve(*e, LearnRead32Cb, 0, &yawA, &pitchA)) return 0;
+	// Safety (2026-10-12, MW2 TU9 crash): never write through an unaligned or
+	// invalid address, and never into something that does not look like an
+	// angle - a wrong learned line must leave the mouse on the stick, not
+	// crash the game.
+	if (!AddrOk(yawA) || (yawA & 3)) return 0;
+	const bool hasPitch = pitchA != 0 && !(pitchA & 3) && AddrOk(pitchA);
+	if (dx == 0 && dy == 0) return hasPitch ? 1 : 2;
+	__try {
+		volatile float* yawP = (volatile float*)yawA;
+		volatile float* pitchP = hasPitch ? (volatile float*)pitchA : 0;
+		float y = *yawP, p = pitchP ? *pitchP : 0.0f;
+		// Not a plausible angle (NaN, infinity, or huge): not our camera.
+		if (!(y > -100000.0f && y < 100000.0f)) return 0;
+		if (pitchP && !(p > -100000.0f && p < 100000.0f)) pitchP = 0;
+		CamApplyMouse(&y, pitchP ? &p : 0, dx, dy, sensitivity, invertY, *e);
+		*yawP = y;
+		if (pitchP) *pitchP = p;
+		return pitchP ? 1 : 2;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+#else
+	(void)titleId; (void)dx; (void)dy; (void)sensitivity; (void)invertY;
+	return 0;
+#endif
+}
+
+#if EN_CAMERA_LEARN
+static void LearnNotify(NotifyStrId id) {
+	swprintf(g_learnMsg, 160, L"%s", WTr(id));
+	MemoryBarrier();
+	g_learnMsgPending = 1;
+}
+static void LearnNotifyInt(NotifyStrId id, int a, int b) {
+	swprintf(g_learnMsg, 160, WTr(id), a, b);
+	MemoryBarrier();
+	g_learnMsgPending = 1;
+}
+static void LearnNotifyInt3(NotifyStrId id, int a, int b, int c) {
+	swprintf(g_learnMsg, 160, WTr(id), a, b, c);
+	MemoryBarrier();
+	g_learnMsgPending = 1;
+}
+static void LearnStick(int32_t rx, int32_t ry) {
+	g_learnRX = rx; g_learnRY = ry;
+	MemoryBarrier();
+}
+// false = canceled (Backspace) or the game changed.
+static bool LearnWait(DWORD ms) {
+	const DWORD start = GetTickCount();
+	while ((GetTickCount() - start) < ms) {
+		if (g_learnAbort || g_lastTitleId != g_learnTitle) return false;
+		Sleep(10);
+	}
+	return !g_learnAbort && g_lastTitleId == g_learnTitle;
+}
+// One push: hold the stick, then centre it and let the camera settle.
+static bool LearnPush(int32_t rx, int32_t ry) {
+	LearnStick(rx, ry);
+	if (!LearnWait(220)) { LearnStick(0, 0); return false; }
+	LearnStick(0, 0);
+	return LearnWait(200);   // games with camera smoothing need a moment to stop
+}
+static bool LearnReadFloat(uint32_t addr, float* out) {
+	__try {
+		if (!AddrOk(addr)) return false;
+		*out = *(volatile float*)addr;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+static bool LearnWriteFloat(uint32_t addr, float v) {
+	__try {
+		if (!AddrOk(addr)) return false;
+		*(volatile float*)addr = v;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+// Unreadable values become 1e30 - implausible, so the filters drop them.
+static void LearnReadCandidates(const CamCandidate* c, size_t n, float* out) {
+	for (size_t i = 0; i < n; i++)
+		if (!LearnReadFloat(c[i].addr, &out[i])) out[i] = 1e30f;
+}
+// Bytes readable from addr (whole 4 KB pages), up to maxBytes.
+static uint32_t LearnValidPrefix(uint32_t addr, uint32_t maxBytes) {
+	uint32_t ok = 0;
+	while (ok < maxBytes) {
+		if (!MmIsAddressValid((PVOID)(addr + ok))) break;
+		const uint32_t pageEnd = ((addr + ok) & ~0xFFFu) + 0x1000u;
+		ok = pageEnd - addr;
+	}
+	return ok > maxBytes ? maxBytes : ok;
+}
+static bool LearnCopy(void* dst, uint32_t src, uint32_t bytes) {
+	__try { memcpy(dst, (const void*)src, bytes); return true; }
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static size_t LearnCollect(const float* before, uint32_t addr, size_t words, const CamLearnLimits& lim,
+                           CamCandidate* out, size_t count, size_t cap) {
+	__try { return CamCollect(before, (const float*)addr, words, addr, lim, out, count, cap); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { return count; }
+}
+
+const size_t LEARN_MAX_PER_BLOCK  = 4096;   // changes kept per block at most (busy blocks are truncated)
+const DWORD  LEARN_WINDOW_MS      = 80;     // block compared with itself this long after
+const uint32_t LEARN_MAX_HEAP     = 640u * 1024u * 1024u;
+const size_t LEARN_MAX_RANGES     = 512;
+// Allocated for the search only (see CameraLearnRun), never kept in memory.
+static CamCandidate* g_learnCand = 0;
+static float*        g_learnNow = 0;
+static size_t        LEARN_MAX_CANDIDATES = 0;
+static float*        g_learnBefore = 0;      // block buffer
+static uint32_t      g_learnBlockBytes = 0;
+static CamRange      g_learnRanges[LEARN_MAX_RANGES];
+static size_t        g_learnNumRanges = 0;
+static size_t        g_learnNumImageRanges = 0;   // the first ones = the executable's own data
+static uint32_t      g_learnTotal = 0;
+static uint32_t      g_learnImageBase = 0, g_learnImageSize = 0;
+
+// ---------------------------------------------------------------------------
+// v3 (2026-10-07) - after "several tests failed on several games" (HB):
+//   1. the stick is now injected into EVERY controller the game reads (see the
+//      end of XInputdReadStateHook): with the pad as player 1, nothing turned;
+//   2. the search covers the game's whole memory (heap), not only the
+//      executable: most games (GTA V, MW3 multi...) keep the camera in
+//      objects they allocate;
+//   3. such a camera moves every session: once confirmed, the plugin looks
+//      for the pointers that lead to it (1 or 2 levels) so it can find it
+//      again next time; if none, it works for this session only;
+//   4. its own log, X360RemapStudio\camera_search.txt, never erased at boot.
+// ---------------------------------------------------------------------------
+
+static void LearnLogPath(char* out, int outSize) { StudioPath(out, outSize, "camera_search.txt"); }
+
+static void LearnLog(const char* fmt, ...) {
+	char line[300];
+	va_list args;
+	va_start(args, fmt);
+	_vsnprintf(line, sizeof(line) - 2, fmt, args);
+	va_end(args);
+	line[sizeof(line) - 2] = '\0';
+	FileLog("Camera search: %hs", line);
+	char path[128];
+	LearnLogPath(path, sizeof(path));
+	std::ofstream f(path, std::ios::binary | std::ios::app);
+	if (f.is_open()) {
+		char stamp[24];
+		_snprintf(stamp, sizeof(stamp) - 1, "[%lu] ", (unsigned long)GetTickCount());
+		stamp[sizeof(stamp) - 1] = '\0';
+		f << stamp << line << "\r\n";
+	}
+}
+
+static void LearnLogStart(uint32_t title) {
+	char path[128];
+	LearnLogPath(path, sizeof(path));
+	std::ofstream f(path, std::ios::binary | std::ios::trunc);
+	if (f.is_open()) {
+		char head[160];
+		_snprintf(head, sizeof(head) - 1, "X360Remap camera search - title %08X - send this file if it fails\r\n",
+			(unsigned int)title);
+		head[sizeof(head) - 1] = '\0';
+		f << head;
+	}
+}
+
+static bool LearnIsOwnMemory(uint32_t a, uint32_t bytes) {
+	struct { uint32_t p; uint32_t n; } own[3] = {
+		{ (uint32_t)g_learnBefore, g_learnBlockBytes },
+		{ (uint32_t)g_learnCand, (uint32_t)(LEARN_MAX_CANDIDATES * sizeof(CamCandidate)) },
+		{ (uint32_t)g_learnNow, (uint32_t)(LEARN_MAX_CANDIDATES * sizeof(float)) },
+	};
+	for (int i = 0; i < 3; i++)
+		if (own[i].p && a < own[i].p + own[i].n && own[i].p < a + bytes) return true;
+	return false;
+}
+
+static uint32_t LearnQueryProtect(uint32_t a, void*) {
+	__try { return (uint32_t)MmQueryAddressProtect((PVOID)a); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Values of the candidates become their new reference ("last").
+static void LearnRebase(CamCandidate* c, size_t n) {
+	LearnReadCandidates(c, n, g_learnNow);
+	for (size_t i = 0; i < n; i++) c[i].last = g_learnNow[i];
+}
+
+// Hold (rx, ry), take a reference, keep holding a moment, filter.
+// Stop (expect 0): half a second to settle (camera smoothing), then 250 ms.
+static bool LearnHoldAndFilter(CamCandidate* c, size_t* n, int32_t rx, int32_t ry, int expect, const CamLearnLimits& lim) {
+	LearnStick(rx, ry);
+	if (!LearnWait(expect == 0 ? 500 : 200)) return false;
+	LearnRebase(c, *n);
+	if (!LearnWait(expect == 0 ? 250 : LEARN_WINDOW_MS)) return false;
+	LearnReadCandidates(c, *n, g_learnNow);
+	*n = CamFilter(c, *n, g_learnNow, expect, lim);
+	return true;
+}
+
+// One round: same direction, opposite direction, stop.
+static bool LearnVerifyRound(CamCandidate* c, size_t* n, int32_t rx, int32_t ry, const CamLearnLimits& lim) {
+	if (*n == 0) return true;
+	if (!LearnHoldAndFilter(c, n, rx, ry, +1, lim)) return false;
+	if (!LearnHoldAndFilter(c, n, -rx, -ry, -1, lim)) return false;
+	if (!LearnHoldAndFilter(c, n, 0, 0, 0, lim)) return false;
+	LearnStick(0, 0);
+	return true;
+}
+
+// Write test: write +D, see if it stays (persistent) and if OTHER candidates
+// follow (the game used our write: this one is the master).
+static bool LearnWriteTest(CamCandidate* c, size_t n) {
+	// Followers are looked for among the first 64 only; up to 128 are tested.
+	static float othersBefore[64];
+	const size_t m = n < 64 ? n : 64;
+	for (size_t i = 0; i < n; i++) {
+		LearnReadCandidates(c, m, othersBefore);
+		float v;
+		if (!LearnReadFloat(c[i].addr, &v)) continue;
+		const float D = 2.0f * c[i].firstDelta;
+		const float w = v + D;
+		if (!LearnWriteFloat(c[i].addr, w)) continue;
+		if (!LearnWait(100)) return false;
+		float rb;
+		if (!LearnReadFloat(c[i].addr, &rb)) continue;
+		c[i].persistent = CamPersistent(w, rb, D) ? 1 : 0;
+		LearnReadCandidates(c, m, g_learnNow);
+		c[i].followers = 0;
+		for (size_t j = 0; j < m; j++)
+			if (j != i && CamFollowsWrite(othersBefore[j], g_learnNow[j], D) && c[i].followers < 255) c[i].followers++;
+		if (c[i].persistent) LearnWriteFloat(c[i].addr, rb - D);   // turn back
+		if (!LearnWait(60)) return false;
+	}
+	return true;
+}
+
+// Block pass over all ranges. Horizontal: stick held right the whole time.
+// Vertical: up / down alternate per block (the pitch stops at its limits);
+// candidates from "down" blocks get their sign flipped (sign = "stick up").
+// When the candidate table is 3/4 full, a verification round prunes it.
+static size_t LearnBlockPass(bool vertical, const CamLearnLimits& lim, bool* aborted) {
+	*aborted = false;
+	size_t n = 0;
+	uint32_t done = 0;
+	int nextPct = 25, block = 0;
+	const int32_t rx = vertical ? 0 : LEARN_STICK, ry = vertical ? LEARN_STICK : 0;
+	// v4 (2026-10-08, HB): small back-and-forth movements on BOTH axes - the
+	// camera no longer spins in circles (games with turn acceleration or
+	// momentum, like Metro, gave unreliable readings).
+	for (size_t r = 0; r < g_learnNumRanges; r++) {
+		uint32_t off = 0;
+		while (off < g_learnRanges[r].size) {
+			const uint32_t addr = g_learnRanges[r].start + off;
+			uint32_t want = g_learnRanges[r].size - off;
+			if (want > g_learnBlockBytes) want = g_learnBlockBytes;
+			const uint32_t bytes = LearnValidPrefix(addr, want) & ~3u;
+			if (bytes == 0) { const uint32_t skip = 0x1000 - (addr & 0xFFF); off += skip; done += skip; continue; }
+			if (LearnIsOwnMemory(addr, bytes)) { off += bytes; done += bytes; continue; }
+
+			if (n > (LEARN_MAX_CANDIDATES * 3) / 4) {
+				const size_t before = n;
+				LearnStick(0, 0);
+				if (!LearnVerifyRound(g_learnCand, &n, rx, ry, lim)) { *aborted = true; return n; }
+				LearnLog("table nearly full: %u -> %u candidates after an early check", (unsigned int)before, (unsigned int)n);
+			}
+
+			// One block = one short push, alternating right/left (or up/down).
+			const int dir = (block & 1) ? -1 : 1;
+			LearnStick(dir * rx, dir * ry);
+			if (!LearnWait(120)) { *aborted = true; return n; }
+			block++;
+			if (g_learnAbort || g_lastTitleId != g_learnTitle) { *aborted = true; return n; }
+			if (LearnCopy(g_learnBefore, addr, bytes)) {
+				if (!LearnWait(LEARN_WINDOW_MS)) { *aborted = true; return n; }
+				const size_t start = n;
+				size_t cap = start + LEARN_MAX_PER_BLOCK;
+				if (cap > LEARN_MAX_CANDIDATES) cap = LEARN_MAX_CANDIDATES;
+				n = LearnCollect(g_learnBefore, addr, bytes / 4, lim, g_learnCand, n, cap);
+				if (dir < 0)
+					for (size_t i = start; i < n; i++) { g_learnCand[i].sign = (int8_t)-g_learnCand[i].sign; g_learnCand[i].firstDelta = -g_learnCand[i].firstDelta; }
+				if (n - start == LEARN_MAX_PER_BLOCK && bytes >= 8 * 0x1000) {
+					// Busy block (v4, Metro log 2026-10-08: 13 blocks truncated -
+					// the camera may well have been in the part that was dropped).
+					// Start it again in 8 smaller pieces, each with its own push,
+					// pruning the table whenever it fills up. Nothing is dropped
+					// unless a single piece is still too busy.
+					n = start;
+					LearnStick(0, 0);
+					const uint32_t piece = (bytes / 8) & ~0xFFFu;
+					size_t kept = 0;
+					for (int k = 0; k < 8; k++) {
+						const uint32_t pa = addr + (uint32_t)k * piece;
+						const uint32_t pb = (k == 7) ? bytes - (uint32_t)k * piece : piece;
+						if (n > (LEARN_MAX_CANDIDATES * 3) / 4) {
+							if (!LearnVerifyRound(g_learnCand, &n, rx, ry, lim)) { *aborted = true; return n; }
+						}
+						const int pdir = (k & 1) ? -dir : dir;
+						LearnStick(pdir * rx, pdir * ry);
+						if (!LearnWait(120)) { *aborted = true; return n; }
+						if (!LearnCopy(g_learnBefore, pa, pb)) { LearnStick(0, 0); continue; }
+						if (!LearnWait(LEARN_WINDOW_MS)) { *aborted = true; return n; }
+						const size_t ps = n;
+						size_t pc = ps + LEARN_MAX_PER_BLOCK;
+						if (pc > LEARN_MAX_CANDIDATES) pc = LEARN_MAX_CANDIDATES;
+						n = LearnCollect(g_learnBefore, pa, pb / 4, lim, g_learnCand, n, pc);
+						if (pdir < 0)
+							for (size_t i = ps; i < n; i++) { g_learnCand[i].sign = (int8_t)-g_learnCand[i].sign; g_learnCand[i].firstDelta = -g_learnCand[i].firstDelta; }
+						if (n - ps == LEARN_MAX_PER_BLOCK)
+							LearnLog("piece %08x still very busy - first %u changes kept", (unsigned int)pa, (unsigned int)(n - ps));
+						kept += n - ps;
+						LearnStick(0, 0);
+					}
+					LearnLog("block %08x busy - scanned again in 8 pieces (%u changes kept)", (unsigned int)addr, (unsigned int)kept);
+				}
+			}
+			off += bytes; done += bytes;
+			LearnStick(0, 0);
+			if (g_learnTotal > 0) {
+				const int pct = (int)(((uint64_t)done * 100u) / g_learnTotal);
+				if (pct >= nextPct && pct < 100) { LearnNotifyInt(STR_LEARN_PROGRESS_FMT, nextPct, 0); nextPct += 25; }
+			}
+		}
+	}
+	LearnStick(0, 0);
+	return n;
+}
+
+// Full search for one axis: block pass, 3 verification rounds, write test.
+// Counters shown to the player after each search ("values > checked > found").
+static uint32_t g_learnStatScan = 0, g_learnStatChecked = 0;
+
+static size_t LearnSearchAxis(bool vertical, const CamLearnLimits& lim, bool* aborted) {
+	const char* axis = vertical ? "pitch" : "yaw";
+	const DWORD t0 = GetTickCount();
+	size_t n = LearnBlockPass(vertical, lim, aborted);
+	if (*aborted) return 0;
+	g_learnStatScan = (uint32_t)n;
+	g_learnStatChecked = 0;
+	LearnLog("%hs: %u candidate(s) after the scan (%u ms)", axis, (unsigned int)n, (unsigned int)(GetTickCount() - t0));
+	if (!LearnWait(300)) { *aborted = true; return 0; }
+	const int32_t rx = vertical ? 0 : LEARN_STICK, ry = vertical ? LEARN_STICK : 0;
+	for (int round = 0; round < 3 && n > 0; round++) {
+		if (!LearnVerifyRound(g_learnCand, &n, rx, ry, lim)) { *aborted = true; return 0; }
+		LearnLog("%hs: %u candidate(s) after check %d/3", axis, (unsigned int)n, round + 1);
+		if (round == 0) g_learnStatChecked = (uint32_t)n;
+		LearnNotifyInt3(vertical ? STR_LEARN_STATS_V_FMT : STR_LEARN_STATS_H_FMT,
+			(int)g_learnStatScan, (int)g_learnStatChecked, (int)n);   // live counters
+	}
+	if (n == 0) return 0;
+	// Lessons from the PC tool (2026-10-08, see camera_learn.h): drop the
+	// duplicate views of the same memory, then test the RAREST movements
+	// first - the real angle is alone, the copies come in crowds.
+	{
+		const size_t before = n;
+		n = CamDedupeViews(g_learnCand, n);
+		if (n != before) LearnLog("%hs: %u duplicate view(s) removed, %u left", axis, (unsigned int)(before - n), (unsigned int)n);
+	}
+	CamRankByRarity(g_learnCand, n);
+	if (n > 128) n = 128;
+	if (!LearnWriteTest(g_learnCand, n)) { *aborted = true; return 0; }
+	CamRank(g_learnCand, n);
+	for (size_t i = 0; i < n && i < 24; i++)
+		LearnLog("%hs: #%u %08x%hs delta=%d/1000 hits=%d persistent=%d followers=%d", axis, (unsigned int)i,
+			(unsigned int)g_learnCand[i].addr,
+			(g_learnCand[i].addr >= g_learnImageBase && g_learnCand[i].addr < g_learnImageBase + g_learnImageSize) ? " (exe)" : " (heap)",
+			(int)(g_learnCand[i].firstDelta * 1000.0f), (int)g_learnCand[i].hits,
+			(int)g_learnCand[i].persistent, (int)g_learnCand[i].followers);
+	LearnLog("%hs: done in %u ms", axis, (unsigned int)(GetTickCount() - t0));
+	return n;
+}
+
+// Pitch next to the yaw first (most engines keep them side by side).
+static uint32_t LearnFindPitchNear(uint32_t yawAddr, int8_t* signY, const CamLearnLimits& lim, bool* aborted) {
+	*aborted = false;
+	static const int offs[8] = { -4, 4, -8, 8, -12, 12, -16, 16 };
+	CamCandidate c[8];
+	size_t n = 0;
+	for (int i = 0; i < 8; i++) {
+		float v;
+		if (!LearnReadFloat(yawAddr + offs[i], &v)) continue;
+		memset(&c[n], 0, sizeof(c[n]));
+		c[n].addr = yawAddr + offs[i];
+		c[n].last = v;
+		n++;
+	}
+	LearnStick(0, LEARN_STICK);
+	if (!LearnWait(200)) { *aborted = true; return 0; }
+	LearnRebase(c, n);
+	if (!LearnWait(LEARN_WINDOW_MS)) { *aborted = true; return 0; }
+	LearnReadCandidates(c, n, g_learnNow);
+	n = CamEstablish(c, n, g_learnNow, lim);
+	if (!LearnHoldAndFilter(c, &n, 0, -LEARN_STICK, -1, lim)) { *aborted = true; return 0; }
+	if (!LearnHoldAndFilter(c, &n, 0, 0, 0, lim)) { *aborted = true; return 0; }
+	for (int r = 0; r < 2 && n > 0; r++)
+		if (!LearnVerifyRound(c, &n, 0, LEARN_STICK, lim)) { *aborted = true; return 0; }
+	LearnStick(0, 0);
+	if (n == 0) return 0;
+	CamRank(c, n);
+	*signY = c[0].sign;
+	return c[0].addr;
+}
+
+// A system message box, at the player's pace (HB, 2026-10-30: notifications
+// were too fast to read). Learning thread only: never XAM from the input path.
+// Returns the button pressed, -1 = closed or game left, -2 = could not open.
+// Backspace only cancels once the box is closed: the box owns its statics
+// until XAM completes it.
+static int LearnBox(const wchar_t* text, int count, NotifyStrId b0, NotifyStrId b1, NotifyStrId b2) {
+	static MESSAGEBOX_RESULT s_result;
+	static XOVERLAPPED s_overlapped;
+	static LPCWSTR s_buttons[3];
+	s_buttons[0] = WTr(b0); s_buttons[1] = WTr(b1); s_buttons[2] = WTr(b2);
+	g_learnInject = 0;
+	LearnStick(0, 0);
+	// ERROR_ACCESS_DENIED while the previous box is still closing (log of 2026-10-31).
+	HRESULT hr = ERROR_ACCESS_DENIED;
+	for (int i = 0; i < 30 && hr == ERROR_ACCESS_DENIED; i++) {
+		if (i) Sleep(100);
+		memset(&s_result, 0, sizeof(s_result));
+		memset(&s_overlapped, 0, sizeof(s_overlapped));
+		hr = XamShowMessageBoxUI(XUSER_INDEX_ANY, WTr(STR_LEARN_BOX_TITLE), text, count, s_buttons, 0,
+			XMB_ALERTICON, &s_result, &s_overlapped);
+	}
+	if (hr != ERROR_IO_PENDING && hr != ERROR_SUCCESS) {
+		LearnLog("message box refused: %08x", (unsigned int)hr);
+		return -2;
+	}
+	while (!XHasOverlappedIoCompleted(&s_overlapped)) {
+		if (g_lastTitleId != g_learnTitle) return -1;
+		Sleep(100);
+	}
+	return s_overlapped.InternalLow == ERROR_SUCCESS ? (int)s_result.dwButtonPressed : -1;
+}
+// End of a search: a box the player cannot miss, a notification if it fails.
+static void LearnResult(NotifyStrId id) {
+	if (LearnBox(WTr(id), 1, STR_LEARN_BTN_OK, STR_LEARN_BTN_OK, STR_LEARN_BTN_OK) == -2) LearnNotify(id);
+}
+
+// Instruction, 5 s to move the mouse (F12 / Backspace still answer), question.
+// 1 = yes, 2 = no, 0 = stopped. Old repeated notification if no box can open.
+static int LearnAsk(NotifyStrId fallback, NotifyStrId instruction, NotifyStrId question, int k, int total) {
+	static wchar_t text[300];
+	swprintf(text, 300, WTr(instruction), k, total);
+	const int go = LearnBox(text, 2, STR_LEARN_BTN_OK, STR_LEARN_BTN_STOP, STR_LEARN_BTN_STOP);
+	if (go != -2) {
+		if (go != 0) return 0;
+		const DWORD t = GetTickCount();
+		while (g_learnAnswer == 0 && (GetTickCount() - t) < 5000)
+			if (!LearnWait(50)) return 0;
+		if (g_learnAnswer != 0) return g_learnAnswer;
+		const int yes = LearnBox(WTr(question), 3, STR_LEARN_BTN_YES, STR_LEARN_BTN_NO, STR_LEARN_BTN_STOP);
+		return yes == 0 ? 1 : yes == 1 ? 2 : 0;
+	}
+	DWORD lastShown = 0;
+	const DWORD t0 = GetTickCount();
+	while (g_learnAnswer == 0 && (GetTickCount() - t0) < 60000) {
+		if (lastShown == 0 || (GetTickCount() - lastShown) >= 5000) {
+			LearnNotifyInt(fallback, k, total);
+			lastShown = GetTickCount();
+		}
+		if (!LearnWait(50)) return 0;
+	}
+	return g_learnAnswer;
+}
+
+// Pointer search for a camera found in the heap. Fills e.levels / base /
+// off1 / yawAddr / pitchAddr. false = no pointer found (session only).
+static bool LearnFindPointerPath(uint32_t yaw, uint32_t pitch, LearnedCamera* e) {
+	static CamPointerHit hits[256];
+	static size_t hitTarget[256];
+	const uint32_t MAX_OFF = 0x4000;
+	// Level 1: a fixed word in the executable pointing just before the yaw.
+	size_t nh = 0;
+	for (size_t r = 0; r < g_learnNumImageRanges && nh < 256; r++) {
+		for (uint32_t off = 0; off < g_learnRanges[r].size; ) {
+			const uint32_t addr = g_learnRanges[r].start + off;
+			uint32_t want = g_learnRanges[r].size - off;
+			if (want > 0x100000) want = 0x100000;
+			const uint32_t bytes = LearnValidPrefix(addr, want) & ~3u;
+			if (bytes == 0) { off += 0x1000 - (addr & 0xFFF); continue; }
+			__try { nh = CamFindPointers((const uint32_t*)addr, bytes / 4, addr, yaw, MAX_OFF, hits, nh, 256); }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			off += bytes;
+		}
+	}
+	if (nh > 0) {
+		size_t best = 0;
+		for (size_t i = 1; i < nh; i++) if (hits[i].value > hits[best].value) best = i;   // closest object start
+		e->levels = 1; e->base = hits[best].loc; e->off1 = 0;
+		e->yawAddr = yaw - hits[best].value;
+		LearnLog("pointer: 1 level, [%08x] + %x (%u candidate pointer(s))", (unsigned int)e->base,
+			(unsigned int)e->yawAddr, (unsigned int)nh);
+	} else {
+		// Level 2: heap words pointing just before the yaw, then fixed words
+		// in the executable pointing just before one of those.
+		static CamPointerHit l1[2048];
+		size_t n1 = 0;
+		for (size_t r = g_learnNumImageRanges; r < g_learnNumRanges && n1 < 2048; r++) {
+			for (uint32_t off = 0; off < g_learnRanges[r].size && n1 < 2048; ) {
+				const uint32_t addr = g_learnRanges[r].start + off;
+				uint32_t want = g_learnRanges[r].size - off;
+				if (want > 0x100000) want = 0x100000;
+				const uint32_t bytes = LearnValidPrefix(addr, want) & ~3u;
+				if (bytes == 0) { off += 0x1000 - (addr & 0xFFF); continue; }
+				if (!LearnIsOwnMemory(addr, bytes)) {
+					__try { n1 = CamFindPointers((const uint32_t*)addr, bytes / 4, addr, yaw, MAX_OFF, l1, n1, 2048); }
+					__except (EXCEPTION_EXECUTE_HANDLER) {}
+				}
+				off += bytes;
+			}
+			if (g_learnAbort) return false;
+		}
+		LearnLog("pointer: %u heap pointer(s) to the camera object", (unsigned int)n1);
+		if (n1 == 0) return false;
+		// Sort level-1 locations (insertion sort: a few hundred at most).
+		for (size_t i = 1; i < n1; i++) {
+			CamPointerHit v = l1[i]; size_t j = i;
+			while (j > 0 && l1[j - 1].loc > v.loc) { l1[j] = l1[j - 1]; j--; }
+			l1[j] = v;
+		}
+		static uint32_t targets[2048];
+		for (size_t i = 0; i < n1; i++) targets[i] = l1[i].loc;
+		nh = 0;
+		for (size_t r = 0; r < g_learnNumImageRanges && nh < 256; r++) {
+			for (uint32_t off = 0; off < g_learnRanges[r].size; ) {
+				const uint32_t addr = g_learnRanges[r].start + off;
+				uint32_t want = g_learnRanges[r].size - off;
+				if (want > 0x100000) want = 0x100000;
+				const uint32_t bytes = LearnValidPrefix(addr, want) & ~3u;
+				if (bytes == 0) { off += 0x1000 - (addr & 0xFFF); continue; }
+				__try { nh = CamFindPointersMulti((const uint32_t*)addr, bytes / 4, addr, targets, n1, 0x1000, hits, hitTarget, nh, 256); }
+				__except (EXCEPTION_EXECUTE_HANDLER) {}
+				off += bytes;
+			}
+		}
+		if (nh == 0) return false;
+		size_t best = 0;
+		uint32_t bestCost = 0xFFFFFFFF;
+		for (size_t i = 0; i < nh; i++) {
+			const CamPointerHit& lv1 = l1[hitTarget[i]];
+			const uint32_t cost = (lv1.loc - hits[i].value) + (yaw - lv1.value);
+			if (cost < bestCost) { bestCost = cost; best = i; }
+		}
+		const CamPointerHit& lv1 = l1[hitTarget[best]];
+		e->levels = 2; e->base = hits[best].loc;
+		e->off1 = lv1.loc - hits[best].value;
+		e->yawAddr = yaw - lv1.value;
+		LearnLog("pointer: 2 levels, [[%08x] + %x] + %x (%u candidate path(s))", (unsigned int)e->base,
+			(unsigned int)e->off1, (unsigned int)e->yawAddr, (unsigned int)nh);
+	}
+	const int32_t rel = pitch ? CamViewDistance(yaw, pitch) : 0;   // same object through any window
+	// 0x4000: Rogue Warrior's pitch is 0x101C below its yaw (2026-11-03).
+	e->pitchAddr = (pitch && rel > -0x4000 && rel < 0x4000) ? (uint32_t)rel : 0;
+	// Check: the path leads to the camera right now.
+	uint32_t ry = 0, rp = 0;
+	if (!CamResolve(*e, LearnRead32Cb, 0, &ry, &rp) || ry != yaw) {
+		LearnLog("pointer: check failed (%08x instead of %08x)", (unsigned int)ry, (unsigned int)yaw);
+		return false;
+	}
+	return true;
+}
+
+static void CameraLearnRunInner() {
+	const CamLearnLimits lim = CamDefaultLimits();
+	const uint32_t title = g_learnTitle;
+	const DWORD tStart = GetTickCount();
+	LearnLogStart(title);
+	uint32_t base = 0, size = 0, stamp = 0; uint8_t* nt = 0;
+	if (!GetTitleImage(&base, &size, &stamp, &nt)) {
+		LearnLog("running executable not found");
+		LearnNotify(STR_LEARN_FAILED);
+		return;
+	}
+	g_learnImageBase = base; g_learnImageSize = size;
+	LearnLog("title %08x image %08x size %08x build %08x", (unsigned int)title,
+		(unsigned int)base, (unsigned int)size, (unsigned int)stamp);
+
+	// 1. The executable's writable sections.
+	g_learnNumRanges = 0;
+	if (nt && MmIsAddressValid(nt)) {
+		uint32_t hdrBytes = LearnValidPrefix((uint32_t)nt, 4096);
+		static uint8_t hdr[4096];
+		if (hdrBytes >= 64 && LearnCopy(hdr, (uint32_t)nt, hdrBytes))
+			g_learnNumRanges = CamParseWritableSections(hdr, hdrBytes, base, g_learnRanges, 16);
+	}
+	if (g_learnNumRanges == 0) {
+		LearnLog("section table not understood - using the whole image");
+		g_learnRanges[0].start = base; g_learnRanges[0].size = size; g_learnNumRanges = 1;
+	}
+	g_learnNumImageRanges = g_learnNumRanges;
+	uint32_t imageBytes = 0;
+	for (size_t i = 0; i < g_learnNumRanges; i++) imageBytes += g_learnRanges[i].size;
+
+	// 2. The game's heap: every writable, cacheable page outside the executables.
+	size_t nr = g_learnNumRanges;
+	nr = CamBuildRanges(LearnQueryProtect, 0, 0x00010000u, 0x40000000u, 0x1000,  g_learnRanges, nr, LEARN_MAX_RANGES);
+	nr = CamBuildRanges(LearnQueryProtect, 0, 0x40000000u, 0x80000000u, 0x10000, g_learnRanges, nr, LEARN_MAX_RANGES);
+	nr = CamBuildRanges(LearnQueryProtect, 0, 0xA0000000u, 0xE0000000u, 0x10000, g_learnRanges, nr, LEARN_MAX_RANGES);
+	nr = CamBuildRanges(LearnQueryProtect, 0, 0xE0000000u, 0,           0x1000,  g_learnRanges, nr, LEARN_MAX_RANGES);
+	g_learnNumRanges = nr;
+	uint32_t heapBytes = 0;
+	for (size_t i = g_learnNumImageRanges; i < nr; i++) {
+		if (heapBytes + g_learnRanges[i].size > LEARN_MAX_HEAP)
+			g_learnRanges[i].size = heapBytes < LEARN_MAX_HEAP ? LEARN_MAX_HEAP - heapBytes : 0;
+		heapBytes += g_learnRanges[i].size;
+	}
+	g_learnTotal = imageBytes + heapBytes;
+	LearnLog("memory: executable %u KB in %u range(s), heap %u KB in %u range(s)%hs",
+		(unsigned int)(imageBytes / 1024), (unsigned int)g_learnNumImageRanges,
+		(unsigned int)(heapBytes / 1024), (unsigned int)(nr - g_learnNumImageRanges),
+		nr >= LEARN_MAX_RANGES ? " (range list full)" : "");
+
+	// Block buffer: as big as the game leaves us.
+	g_learnBlockBytes = 2u * 1024u * 1024u;
+	g_learnBefore = 0;
+	while (!g_learnBefore && g_learnBlockBytes >= 64u * 1024u) {
+		g_learnBefore = (float*)malloc(g_learnBlockBytes);
+		if (!g_learnBefore) g_learnBlockBytes /= 2;
+	}
+	if (!g_learnBefore) {
+		LearnLog("no memory for the block buffer");
+		LearnNotify(STR_LEARN_FAILED);
+		return;
+	}
+	LearnLog("blocks of %u KB, room for %u candidates", (unsigned int)(g_learnBlockBytes / 1024),
+		(unsigned int)LEARN_MAX_CANDIDATES);
+
+	const int go = LearnBox(WTr(STR_LEARN_BOX_START), 2, STR_LEARN_BTN_START, STR_LEARN_BTN_STOP, STR_LEARN_BTN_STOP);
+	if (go != 0 && go != -2) { LearnLog("not started"); LearnNotify(STR_LEARN_CANCELED); return; }
+	LearnNotify(STR_LEARN_START);
+	g_learnInject = 1;
+	LearnStick(0, 0);
+	if (!LearnWait(1200)) { LearnNotify(STR_LEARN_CANCELED); return; }
+	if ((GetTickCount() - g_learnHookTick) > 1000) {
+		LearnLog("no controller is being read by the game (not in gameplay?)");
+		LearnResult(STR_LEARN_NO_INPUT);
+		return;
+	}
+
+	bool aborted = false;
+	size_t n = LearnSearchAxis(false, lim, &aborted);
+	if (aborted) { LearnStick(0, 0); LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+	if (n == 0) {
+		LearnLog("no yaw found - %u ms", (unsigned int)(GetTickCount() - tStart));
+		LearnStick(0, 0);
+		LearnNotifyInt3(STR_LEARN_STATS_H_FMT, (int)g_learnStatScan, (int)g_learnStatChecked, 0);
+		LearnWait(3000);                           // let the counters be read first
+		LearnResult(STR_LEARN_NOT_FOUND);
+		return;
+	}
+	// --- 1. Horizontal: confirmed with the mouse before going any further ---
+	// Only values the game KEEPS when we write them can be driven by the mouse
+	// (Metro log 2026-10-08: 42 candidates, none kept - the player was asked
+	// 8 times with a frozen camera). Persistent ones only; if there are none,
+	// two tries at most, then an honest message.
+	static CamCandidate yawCand[8];
+	size_t tries = 0, persistentCount = 0;
+	for (size_t i = 0; i < n && tries < 8; i++)
+		if (g_learnCand[i].persistent) { yawCand[tries++] = g_learnCand[i]; persistentCount++; }
+	if (tries == 0)
+		for (size_t i = 0; i < n && tries < 2; i++) yawCand[tries++] = g_learnCand[i];
+	LearnLog("horizontal: %u persistent candidate(s), %u to try", (unsigned int)persistentCount, (unsigned int)tries);
+	g_learnInject = 0;
+	LearnStick(0, 0);
+	LearnNotifyInt3(STR_LEARN_STATS_H_FMT, (int)g_learnStatScan, (int)g_learnStatChecked, (int)n);
+	if (!LearnWait(2500)) { LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+
+	LearnedCamera e;
+	memset(&e, 0, sizeof(e));
+	e.titleId = title; e.timeStamp = stamp; e.imageSize = size;
+	e.levels = 0; e.signY = 1;
+	_snprintf(e.name, sizeof(e.name) - 1, "Title %08X", (unsigned int)title);
+	bool yawOk = false;
+	for (size_t k = 0; k < tries && !yawOk; k++) {
+		const CamCandidate& c = yawCand[k];
+		e.yawAddr = c.addr; e.pitchAddr = 0;           // vertical stays on the stick for now
+		e.signX = c.sign;
+		e.unit = (uint8_t)CamGuessUnit(c.firstDelta * (1000.0f / (float)LEARN_WINDOW_MS) * 0.22f);
+		LearnLog("horizontal: trying %08x sign %d unit %hs", (unsigned int)e.yawAddr, (int)e.signX,
+			e.unit == CAM_UNIT_RADIANS ? "rad" : "deg");
+		g_learnTest = e;
+		MemoryBarrier();
+		g_learnAnswer = 0;
+		g_learnTestActive = 1;
+		g_learnState = LEARN_CONFIRM;
+		const int answer = LearnAsk(STR_LEARN_CONFIRM_FMT, STR_LEARN_BOX_TEST_H_FMT, STR_LEARN_BOX_ASK_H, (int)k + 1, (int)tries);
+		g_learnState = LEARN_RUNNING;
+		g_learnTestActive = 0;
+		if (answer == 0) { LearnLog("no answer - canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+		if (answer == 1) { yawOk = true; LearnLog("horizontal confirmed: %08x", (unsigned int)e.yawAddr); }
+		else LearnLog("horizontal rejected: %08x", (unsigned int)c.addr);
+	}
+	if (!yawOk) {
+		// No horizontal camera: no point looking for the vertical one.
+		LearnLog("no horizontal camera confirmed - stop");
+		LearnResult(persistentCount == 0 ? STR_LEARN_RECOMPUTED : STR_LEARN_NOT_FOUND);
+		return;
+	}
+
+	// --- 2. Vertical, only now ---
+	const int goV = LearnBox(WTr(STR_LEARN_BOX_VERTICAL), 2, STR_LEARN_BTN_OK, STR_LEARN_BTN_STOP, STR_LEARN_BTN_STOP);
+	if (goV == -2) LearnNotify(STR_LEARN_VERTICAL_START);
+	else if (goV != 0) { LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+	if (!LearnWait(1500)) { LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+	g_learnInject = 1;
+	static CamCandidate pitchCand[8];
+	size_t np = 0;
+	int8_t signY = 1;
+	const uint32_t nearPitch = LearnFindPitchNear(e.yawAddr, &signY, lim, &aborted);
+	if (aborted) { LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+	if (nearPitch) {
+		memset(&pitchCand[0], 0, sizeof(pitchCand[0]));
+		pitchCand[0].addr = nearPitch; pitchCand[0].sign = signY;
+		np = 1;
+		g_learnStatScan = 8; g_learnStatChecked = 1;
+	} else {
+		LearnLog("pitch not next to the yaw - full vertical search");
+		const size_t found = LearnSearchAxis(true, lim, &aborted);
+		if (aborted) { LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+		np = 0;
+		for (size_t i = 0; i < found && np < 8; i++) if (g_learnCand[i].persistent) pitchCand[np++] = g_learnCand[i];
+		if (np == 0) for (size_t i = 0; i < found && np < 2; i++) pitchCand[np++] = g_learnCand[i];
+	}
+	g_learnInject = 0;
+	LearnStick(0, 0);
+	LearnNotifyInt3(STR_LEARN_STATS_V_FMT, (int)g_learnStatScan, (int)g_learnStatChecked, (int)np);
+	if (!LearnWait(2500)) { LearnLog("canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+
+	bool pitchOk = false;
+	for (size_t k = 0; k < np && !pitchOk; k++) {
+		e.pitchAddr = pitchCand[k].addr;
+		e.signY = pitchCand[k].sign;
+		LearnLog("vertical: trying %08x sign %d", (unsigned int)e.pitchAddr, (int)e.signY);
+		g_learnTest = e;
+		MemoryBarrier();
+		g_learnAnswer = 0;
+		g_learnTestActive = 1;
+		g_learnState = LEARN_CONFIRM;
+		const int answer = LearnAsk(STR_LEARN_CONFIRM_V_FMT, STR_LEARN_BOX_TEST_V_FMT, STR_LEARN_BOX_ASK_V, (int)k + 1, (int)np);
+		g_learnState = LEARN_RUNNING;
+		g_learnTestActive = 0;
+		if (answer == 0) { LearnLog("no answer - canceled"); LearnNotify(STR_LEARN_CANCELED); return; }
+		if (answer == 1) { pitchOk = true; LearnLog("vertical confirmed: %08x", (unsigned int)e.pitchAddr); }
+		else LearnLog("vertical rejected: %08x", (unsigned int)e.pitchAddr);
+	}
+	if (!pitchOk) {
+		e.pitchAddr = 0; e.signY = 1;              // horizontal only: vertical stays on the stick
+		LearnLog("no vertical camera confirmed - horizontal only");
+	}
+	LearnLog("search took %u ms", (unsigned int)(GetTickCount() - tStart));
+
+	// --- 3. Permanent address, then save ---
+	const bool inExe = e.yawAddr >= base && e.yawAddr < base + size;
+	bool permanent = inExe;
+	if (!inExe) {
+		LearnNotify(STR_LEARN_SAVING);
+		LearnedCamera p = e;
+		if (LearnFindPointerPath(e.yawAddr, e.pitchAddr, &p)) { e = p; permanent = true; }
+	}
+	if (permanent) {
+		const bool ok = SaveLearnedCamera(e);
+		LearnLog(ok ? "saved (%d pointer level(s))" : "FAILED to save (%d pointer level(s))", (int)e.levels);
+		if (ok) LoadLearnedCameras();
+		LearnResult(!ok ? STR_LEARN_FAILED : e.pitchAddr ? STR_LEARN_SAVED : STR_LEARN_SAVED_H);
+	} else {
+		g_learnTest = e;
+		MemoryBarrier();
+		g_learnTestActive = 2;                      // this session only, until the game changes
+		LearnLog("no permanent address found - active for this session only");
+		LearnResult(STR_LEARN_SESSION_ONLY);
+	}
+}
+
+// Memory for the duration of the search only.
+static void CameraLearnRun() {
+	size_t cap = 65536;
+	while (cap >= 4096) {
+		g_learnCand = (CamCandidate*)malloc(cap * sizeof(CamCandidate));
+		g_learnNow = g_learnCand ? (float*)malloc(cap * sizeof(float)) : 0;
+		if (g_learnCand && g_learnNow) break;
+		free(g_learnCand); free(g_learnNow);
+		g_learnCand = 0; g_learnNow = 0;
+		cap /= 2;
+	}
+	if (!g_learnCand) {
+		FileLog("Camera search: no memory for the candidates");
+		LearnNotify(STR_LEARN_FAILED);
+		return;
+	}
+	LEARN_MAX_CANDIDATES = cap;
+	CameraLearnRunInner();
+	free(g_learnBefore); g_learnBefore = 0; g_learnBlockBytes = 0;
+	free(g_learnCand); free(g_learnNow);
+	g_learnCand = 0; g_learnNow = 0;
+	LEARN_MAX_CANDIDATES = 0;
+}
+
+DWORD WINAPI CameraLearnThreadProc(LPVOID) {
+	__try {
+		CameraLearnRun();
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		FileLog("Camera search: EXCEPTION %08x - stopped", (unsigned int)GetExceptionCode());
+		LearnNotify(STR_LEARN_FAILED);
+	}
+	if (g_learnCand) { free(g_learnCand); g_learnCand = 0; }   // after an exception inside the search
+	if (g_learnNow)  { free(g_learnNow);  g_learnNow = 0; }
+	LEARN_MAX_CANDIDATES = 0;
+	if (g_learnBefore) { free(g_learnBefore); g_learnBefore = 0; g_learnBlockBytes = 0; }
+	LearnStick(0, 0);
+	g_learnInject = 0;
+	if (g_learnTestActive == 1) g_learnTestActive = 0;   // 2 = session camera, kept until the game changes
+	MemoryBarrier();
+	g_learnState = LEARN_IDLE;
+	return 0;
+}
+
+// Polling thread, every tick: keys, start, notifications.
+static void CameraLearnPoll(int keyCode) {
+	static int s_hold = 0;
+	static bool s_triggered = false;
+	static int s_prevKey = -1;
+	const bool edge = (keyCode != s_prevKey);
+	s_prevKey = keyCode;
+
+	if (g_learnMsgPending) {
+		g_learnMsgPending = 0;
+		MemoryBarrier();
+		FlushLogBuffer();   // disk BEFORE XNotifyUI, same precaution as everywhere else
+		XNotifyUI(XNOTIFYUI_CUSTOM, g_learnMsg);
+	}
+	if (g_learnedNotifyPending) {
+		g_learnedNotifyPending = 0;
+		const int i = g_learnedNotifyIdx;
+		if (i >= 0 && i < g_learnedCount) {
+			FileLog("Direct aim ready (learned camera): %hs", g_learned[i].name);
+			FlushLogBuffer();
+			wchar_t msg[160];
+			swprintf(msg, 160, WTr(STR_MOUSEHOOK_ON_FMT), g_learned[i].name);
+			XNotifyUI(XNOTIFYUI_CUSTOM, msg);
+		}
+	}
+
+	// Session-only camera (no permanent address): dropped when the game changes.
+	if (g_learnTestActive == 2 && g_lastTitleId != g_learnTitle) {
+		g_learnTestActive = 0;
+		FileLog("Camera search: session camera dropped (game changed)");
+	}
+	const int st = g_learnState;
+	if (st == LEARN_IDLE) {
+		if (keyCode == LEARN_KEY_START) {
+			if (++s_hold >= LEARN_HOLD_TICKS && !s_triggered) {
+				s_triggered = true;
+				if (g_lastTitleId == 0) {
+					XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(STR_LEARN_NEED_GAME));
+				} else {
+					FileLog("Camera search: started for title %08x", (unsigned int)g_lastTitleId);
+					g_learnTestActive = 0;          // a new search replaces a session camera
+					g_learnTitle = g_lastTitleId;
+					g_learnAbort = 0;
+					g_learnAnswer = 0;
+					MemoryBarrier();
+					g_learnState = LEARN_RUNNING;
+					MakeThread((LPTHREAD_START_ROUTINE)CameraLearnThreadProc, nullptr);
+				}
+			}
+		} else {
+			s_hold = 0;
+			s_triggered = false;
+		}
+		return;
+	}
+	if (g_lastTitleId != g_learnTitle) g_learnAbort = 1;
+	if (edge && keyCode == LEARN_KEY_NEXT) {
+		if (st == LEARN_CONFIRM) g_learnAnswer = 2;
+		else g_learnAbort = 1;
+	}
+	if (edge && keyCode == LEARN_KEY_START && st == LEARN_CONFIRM) g_learnAnswer = 1;
+}
+#endif // EN_CAMERA_LEARN
 
 // Index de la souris vid/pid encore branchee, -1 sinon (debranchee entre le
 // reglage et l'enregistrement : on n'ecrit rien).
@@ -1369,6 +3566,27 @@ int FindNewlyPressedRealButton(const XINPUT_GAMEPAD* previous, const XINPUT_GAME
     return -1;
 }
 
+// Key held on ANY keyboard interface (2026-10-11, Razer Tartarus V2: it has
+// two keyboard interfaces and sends its keys on the SECOND one; only the
+// first was read for the Studio, the wizard and the shortcuts, so "no key
+// does anything" in X360RemapStudio while the same keys worked in a game).
+static uint8_t AnyKeyboardKeyCode() {
+	for (int i = 0; i < 4; i++)
+		if (connectedControllers[i].controllerDriver && connectedControllers[i].isKeyboard &&
+		    !connectedControllers[i].isExtraKeyboardIf &&
+		    connectedControllers[i].lastKeyCode != 0xFF)
+			return connectedControllers[i].lastKeyCode;
+	return 0xFF;
+}
+static uint8_t AnyKeyboardModifiers() {
+	uint8_t m = 0;
+	for (int i = 0; i < 4; i++)
+		if (connectedControllers[i].controllerDriver && connectedControllers[i].isKeyboard &&
+		    !connectedControllers[i].isExtraKeyboardIf)
+			m |= connectedControllers[i].lastModifiers;
+	return m;
+}
+
 // Cherche la VRAIE manette physique (pas celle emulee par ce plugin - voir
 // Controller::userIndex, deja assigne via XamUserBindDeviceCallback pour nos
 // propres peripheriques HID, voir InitStage6 plus haut) parmi les 4 slots
@@ -1394,7 +3612,12 @@ bool ReadRealControllerState(XINPUT_GAMEPAD* out, uint8_t* outUserIndex) {
 
         XINPUT_STATE state;
         memset(&state, 0, sizeof(XINPUT_STATE));
-        if (XInputGetState(candidate, &state) == ERROR_SUCCESS) {
+        // Our own read: the merged-players code must not add the keyboard /
+        // mouse here (it would use up the mouse movement from this thread).
+        g_pollRealRead = true;
+        const DWORD gs = XInputGetState(candidate, &state);
+        g_pollRealRead = false;
+        if (gs == ERROR_SUCCESS) {
             *out = state.Gamepad;
             *outUserIndex = candidate;
             return true;
@@ -1427,9 +3650,165 @@ DWORD g_quickBindDeadlineMs = 0;      // GetTickCount() au-dela duquel on annule
 
 // Deferred USB re-enumeration - see MappingManagerThreadProc. Set to 0 to
 // disable and go back to "unplug/replug after boot".
-#define DEFERRED_USB_RESET 1
+#define DEFERRED_USB_RESET 0   // 1.4: no USB reset, see docs/USB_RESET.md
 DWORD g_titleStableSince = 0;
 bool  g_deferredResetDone = false;
+
+// --- USB boot report (1.4, READ ONLY, 2026-11-16) ---------------------------
+// Devices plugged in at power-on are enumerated before this plugin loads, so
+// HidAddDeviceHook never sees them and the player must replug once. Two fixes
+// exist elsewhere and both need facts about those devices first:
+//  - Jacckii (Xbox360-Series-Controllers-Native, GPL-3): ordinal 890 re-offers
+//    ports parked in the unrecognized table. Tried 2026-11-16: 0 parked ports on
+//    HB's console, so a boot keyboard / mouse is not there. Removed.
+//  - usb-audio-x360 (TimeoutTim, GPL-3, src/driver.cpp ReenumerateBootDevice):
+//    resets ONE root-hub port of a device the kernel rejected, only if it is the
+//    only device on that controller.
+// This report only READS kernel 17559 tables and logs, per controller and port,
+// the device node, its VID:PID and the controller state usb-audio-x360 checks.
+// It resets nothing and sends nothing to any device.
+#define K_UNRECOGNIZED_PORTS  0x801A7FA0   // {hub node, port mask} x 20, kernel 17559 (Jacckii)
+#define K_UNRECOGNIZED_COUNT  20
+#define K_USB_DEVICE_STATE    0x801A8220   // per controller state, kernel 17559 (usb-audio-x360)
+#define K_USB_HCD_TABLE       0x801A8230   // per controller HCD, kernel 17559 (usb-audio-x360)
+#define K_RESET_ROOT_PORT     0x800D7D20   // root-hub port reset routine (checked; called only for ports listed in usb_port_reset.txt)
+bool g_dashSinceLoad = false;    // a "back to dashboard" title switch was seen since load
+bool g_usbRescanDone = false;    // the report ran this boot
+// Port map (2026-11-18, HB: reset only the front ports, never the Wi-Fi): after the
+// boot report, the report runs again ~2 s after a device arrives (HidAddDevice), or
+// when usb_report.txt is put in the Studio folder (deleted once done). Read only.
+volatile bool  g_usbReportWanted = false;
+volatile DWORD g_usbReportWantedAt = 0;
+
+// Called once from the polling thread when the dashboard is settled.
+static void RunGentleUsbRescan() {
+	HANDLE kernel = NULL;
+	PVOID rootFn = NULL, portFn = NULL;
+	if (XexGetModuleHandle("xboxkrnl.exe", &kernel) < 0 || !kernel) { FileLog("USB report: no kernel handle - skipped"); return; }
+	XexGetProcedureAddress(kernel, 880, &rootFn);   // UsbdGetRootHubDeviceNode(controller)
+	XexGetProcedureAddress(kernel, 881, &portFn);   // UsbdGetPortDeviceNode(root, port)
+	const WORD build = XboxKrnlVersion->Build;
+	if (build != 17559 || !rootFn || !portFn || !UsbdGetDeviceDescriptor) {
+		FileLog("USB report: kernel %u is not the analysed 17559 layout - skipped", (unsigned)build);
+		return;
+	}
+
+	int parked = 0;
+	for (int i = 0; i < K_UNRECOGNIZED_COUNT; i++)
+		if (*(volatile DWORD*)(K_UNRECOGNIZED_PORTS + i * 8)) parked++;
+	const volatile DWORD* rr = (const volatile DWORD*)K_RESET_ROOT_PORT;
+	const bool resetLayout = rr[0] == 0x7D8802A6 && rr[1] == 0x9181FFF8 && rr[2] == 0xFBE1FFF0 && rr[3] == 0x9421FFA0;
+	FileLog("USB report: %d parked port(s), port reset routine %s", parked, resetLayout ? "as expected" : "DIFFERENT");
+
+	typedef deviceHandle* (*RootFn)(DWORD);
+	typedef deviceHandle* (*PortFn)(deviceHandle*, DWORD);
+	for (DWORD c = 0; c < 4; c++) {
+		BYTE* hcd = ((BYTE**)K_USB_HCD_TABLE)[c];
+		BYTE* st  = ((BYTE**)K_USB_DEVICE_STATE)[c];
+		deviceHandle* root = ((RootFn)rootFn)(c);
+		if (!hcd && !root) continue;
+		// The fields usb-audio-x360 checks before a port reset: flag, state->hcd link,
+		// hcd->root link, the two state words that are 0 when no driver took the
+		// device, the cached descriptor of the last device seen there.
+		FileLog("USB report: controller %u hcd=%08x flag=%02x pool=%08x root=%08x/%08x state=%08x link=%d w4=%08x w8=%08x cached=%04x:%04x",
+			c, (DWORD)hcd, hcd ? hcd[0x96] : 0, hcd ? *(DWORD*)(hcd + 0x40) : 0,
+			(DWORD)root, hcd ? *(DWORD*)(hcd + 0x48) : 0, (DWORD)st,
+			(st && hcd) ? (*(BYTE**)st == hcd) : 0,
+			st ? *(DWORD*)(st + 4) : 0, st ? *(DWORD*)(st + 8) : 0,
+			st ? swap_endianness_16(*(WORD*)(st + 0x4C + 8)) : 0, st ? swap_endianness_16(*(WORD*)(st + 0x4C + 10)) : 0);
+		if (!root) continue;
+		for (DWORD p = 0; p < 8; p++) {
+			deviceHandle* dev = ((PortFn)portFn)(root, p);
+			if (!dev) continue;
+			// shortcut: per Jacckii the descriptor getter may return the last enumerated
+			// device instead of this node's; the VID:PID here is a hint, not proof.
+			usb_device_descriptor* d = UsbdGetDeviceDescriptor(dev);
+			FileLog("USB report:   port %u node=%08x vid:pid=%04x:%04x class=%02x", p, (DWORD)dev,
+				d ? swap_endianness_16(d->idVendor) : 0, d ? swap_endianness_16(d->idProduct) : 0, d ? d->bDeviceClass : 0);
+		}
+	}
+	FileLog("USB report: done (read only, nothing was reset) - replug devices plugged at power-on");
+	FlushLogBuffer();
+}
+// --- Port reset at boot, opt-in (2026-11-18, HB) ------------------------------
+// A keyboard / mouse plugged at power-on is taken by the console's own driver
+// before this plugin loads; resetting ITS root-hub port makes it enumerate again,
+// through our HidAddDevice hook. Same call as usb-audio-x360 (TimeoutTim, GPL-3,
+// src/driver.cpp ReenumerateBootDevice): ResetRootHubPort(root node, port), from a
+// thread, kernel 17559 only, routine prologue checked. Only the ports listed in
+// usb_port_reset.txt ("controller:port" per line, e.g. "3:0") are touched, one every
+// 3 s, once per boot: the port map differs between consoles (HB's Slim: front =
+// 3:0 and 3:1, rear = 2:0 2:2 2:3, Wi-Fi on controller 1). No file = nothing reset.
+// An empty port is skipped.
+#define K_NODE_POOL_BYTES 0x1000
+static DWORD g_portResetList[8][2];
+static int   g_portResetCount = -1;      // -1 = file not read yet
+static int   g_portResetNext = 0;
+static DWORD g_portResetAt = 0;
+
+static bool InUsbNodePool(const BYTE* pool, const void* address) {
+	const BYTE* v = (const BYTE*)address;
+	return pool && v >= pool && v < pool + K_NODE_POOL_BYTES && (((DWORD)(v - pool) & 0x0F) == 0);
+}
+
+static void ReadPortResetList() {
+	g_portResetCount = 0;
+	char path[128];
+	StudioPath(path, sizeof(path), "usb_port_reset.txt");
+	std::ifstream f(path);
+	if (!f.is_open()) return;
+	std::string line;
+	while (std::getline(f, line) && g_portResetCount < 8) {
+		unsigned c = 9, pt = 9;
+		if (sscanf(line.c_str(), "%u:%u", &c, &pt) == 2 && c < 4 && pt < 8) {
+			g_portResetList[g_portResetCount][0] = c;
+			g_portResetList[g_portResetCount][1] = pt;
+			g_portResetCount++;
+		}
+	}
+	FileLog("USB port reset: %d port(s) listed in usb_port_reset.txt", g_portResetCount);
+}
+
+// One listed port per call; true while ports remain.
+static bool ResetNextListedPort() {
+	if (g_portResetNext >= g_portResetCount) return false;
+	const DWORD c = g_portResetList[g_portResetNext][0], pt = g_portResetList[g_portResetNext][1];
+	g_portResetNext++;
+	HANDLE kernel = NULL;
+	PVOID rootFn = NULL, portFn = NULL;
+	if (XexGetModuleHandle("xboxkrnl.exe", &kernel) < 0 || !kernel) return false;
+	XexGetProcedureAddress(kernel, 880, &rootFn);
+	XexGetProcedureAddress(kernel, 881, &portFn);
+	const volatile DWORD* rr = (const volatile DWORD*)K_RESET_ROOT_PORT;
+	if (XboxKrnlVersion->Build != 17559 || !rootFn || !portFn || !UsbdGetDeviceDescriptor ||
+		!(rr[0] == 0x7D8802A6 && rr[1] == 0x9181FFF8 && rr[2] == 0xFBE1FFF0 && rr[3] == 0x9421FFA0)) {
+		FileLog("USB port reset %u:%u: not the analysed 17559 kernel - skipped", c, pt);
+		g_portResetNext = g_portResetCount;
+		return false;
+	}
+	typedef deviceHandle* (*RootFn)(DWORD);
+	typedef deviceHandle* (*PortFn)(deviceHandle*, DWORD);
+	typedef VOID (*ResetFn)(deviceHandle*, DWORD);
+	BYTE* hcd = ((BYTE**)K_USB_HCD_TABLE)[c];
+	deviceHandle* root = ((RootFn)rootFn)(c);
+	deviceHandle* dev = root ? ((PortFn)portFn)(root, pt) : NULL;
+	BYTE* pool = hcd ? *(BYTE**)(hcd + 0x40) : NULL;
+	if (!hcd || !root || !dev || *(deviceHandle**)(hcd + 0x48) != root ||
+		!InUsbNodePool(pool, root) || !InUsbNodePool(pool, dev)) {
+		FileLog("USB port reset %u:%u: no device there (or tables not as expected) - skipped", c, pt);
+		return g_portResetNext < g_portResetCount;
+	}
+	// No VID test: the descriptor read here is the controller's LAST enumerated device
+	// (2026-11-18: the Rapoo's port read 045e:02aa, the internal device of port 3), so
+	// only the user's list decides. The Wi-Fi port must simply not be listed.
+	FileLog("USB port reset %u:%u: resetting node %08x", c, pt, (DWORD)dev);
+	FlushLogBuffer();
+	((ResetFn)K_RESET_ROOT_PORT)(root, pt);
+	FileLog("USB port reset %u:%u: done", c, pt);
+	FlushLogBuffer();
+	return g_portResetNext < g_portResetCount;
+}
+
 // Defined further down (set by initFunctionPointers), but needed by the polling
 // thread above it.
 extern DWORD UsbPhysicalPage;
@@ -1446,9 +3825,10 @@ DWORD    g_lastJsonSize = 0;
 bool     g_jsonStateKnown = false;
 DWORD    g_lastJsonCheck = 0;
 
-bool GetJsonFileStamp(FILETIME* outTime, DWORD* outSize) {
+// Last write time and size of one file of the Studio folder.
+static bool GetStudioFileStamp(const char* fileName, FILETIME* outTime, DWORD* outSize) {
 	char jsonPath[128];
-	StudioPath(jsonPath, sizeof(jsonPath), "X360Remap.json");
+	StudioPath(jsonPath, sizeof(jsonPath), fileName);
 	HANDLE h = CreateFileA(jsonPath, GENERIC_READ, FILE_SHARE_READ,
 		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (h == INVALID_HANDLE_VALUE)
@@ -1458,6 +3838,10 @@ bool GetJsonFileStamp(FILETIME* outTime, DWORD* outSize) {
 	*outSize = GetFileSize(h, nullptr);
 	CloseHandle(h);
 	return ok;
+}
+
+bool GetJsonFileStamp(FILETIME* outTime, DWORD* outSize) {
+	return GetStudioFileStamp("X360Remap.json", outTime, outSize);
 }
 
 // Apres une ecriture faite PAR LE PLUGIN LUI-MEME (F9, liaison rapide) :
@@ -1503,6 +3887,7 @@ int g_jsonReloadFailures = 0;
 #define EN_FIX_INPUT_STATE_ONLY_WITH_STUDIO 1
 
 volatile bool g_studioActive = false;
+static volatile uint32_t g_padButtonsHeld = 0;   // see HidFillButtonsReport
 // Tant qu'aucune Studio n'a JAMAIS pose ce fichier depuis le demarrage, on
 // ecrit comme avant : une Studio ancienne reste donc pleinement fonctionnelle
 // avec ce plugin, elle ne profite simplement pas de l'economie d'ecritures.
@@ -1529,6 +3914,7 @@ MappingState g_mappingState;
 int interruptHandler(DWORD deviceHandle, int32_t a2);
 bool DetectIsMouse(HID_ReportInfo_t* info, uint8_t reportId);
 bool DetectIsKeyboard(HID_ReportInfo_t* info);
+bool DetectIsGamepad(HID_ReportInfo_t* info);
 
 // Keep every IN report item; the driver uses all axes, the hat, and buttons.
 bool CALLBACK_HIDParser_FilterHIDReportItem(HID_ReportItem_t* const CurrentItem) {
@@ -1681,6 +4067,25 @@ int32_t noopCompleteHandler(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+// Completion of a close request (clean unplug, 2026-10-12). Runs in the USB
+// completion context: only counters here, no log flush, no USB call. The
+// argument is the address of the close request itself.
+static void CloseRequestDone(HidControllerExtension* drv, int which, int32_t status) {
+	if (!drv) return;
+	(void)which; (void)status;   // NO FileLog here: USB completion context (see Controller::keyRaw)
+	if (InterlockedDecrement(&drv->closePending) <= 0) {
+		drv->closeDoneAt = GetTickCount() | 1;   // never 0
+	}
+}
+int32_t CloseDataEpComplete(DWORD request, int32_t status) {
+	CloseRequestDone((HidControllerExtension*)(request - offsetof(HidControllerExtension, closeReq)), 0, status);
+	return 0;
+}
+int32_t CloseDefaultEpComplete(DWORD request, int32_t status) {
+	CloseRequestDone((HidControllerExtension*)(request - offsetof(HidControllerExtension, closeReq) - sizeof(UsbTrb)), 1, status);
+	return 0;
+}
+
 // --- Forcage du Boot Protocol : debrayable (2026-08-03) -------------------
 // Le SET_PROTOCOL(boot) ajoute plus tot dans la journee a repare le curseur
 // d'une souris (VID:046a PID:b092) mais a fait perdre la MOLETTE sur les
@@ -1823,6 +4228,49 @@ static Controller* FindControllerByHandle(DWORD deviceHandle) {
 	return nullptr;
 }
 
+// True when a HID report descriptor uses Report IDs (global item 0x85).
+// Walks the items properly (a data byte equal to 0x85 is not a match).
+// Plain loop, no CRT: safe in a USB completion callback.
+static bool DescHasReportId(const uint8_t* d, uint16_t len) {
+	uint16_t i = 0;
+	while (i < len) {
+		uint8_t b = d[i];
+		if (b == 0xFE) {                       // long item: FE, size, tag, data
+			if (i + 1 >= len) break;
+			i = (uint16_t)(i + 3 + d[i + 1]);
+			continue;
+		}
+		uint8_t sz = (uint8_t)(b & 0x03);
+		if (sz == 3) sz = 4;
+		if ((b & 0xFC) == 0x84) return true;   // Report ID
+		i = (uint16_t)(i + 1 + sz);
+	}
+	return false;
+}
+
+int32_t SetBootProtocolComplete(DWORD deviceHandle, int32_t status);
+
+// Step 4 (2026-10-29, HB's Rapoo 24AE:2015 dongle): a mouse read with its own
+// descriptor is NOT always in report protocol. The Rapoo mouse interface kept
+// sending boot-format reports (buttons, X, Y, wheel - no Report ID byte) while
+// its descriptor declares Report IDs, so the native reader took the X byte for
+// the buttons (random clicks, no motion). When the descriptor uses Report IDs,
+// ask for the report protocol explicitly, so the reports match the descriptor.
+// Last link of the chain, same controlTrb, nothing queued after it.
+static void RequestReportProtocolIfNeeded(Controller* ctrl) {
+	if (!ctrl || !ctrl->reportDescReady || ctrl->reportDescLen == 0)
+		return;
+	if (g_bootProtocolMode == BOOTPROTO_ALWAYS)
+		return;
+	if (!DescHasReportId(ctrl->reportDescBuf, ctrl->reportDescLen))
+		return;
+	ctrl->reportProtocolRequested = true;
+	SendControlRequest(ctrl->deviceHandle, &ctrl->controllerDriver->controlTrb,
+		0x21 /* Host->Device, Class, Interface */, 0x0B /* SET_PROTOCOL */,
+		1 /* wValue: 1 = Report Protocol */, ctrl->interfaceNumber,
+		0, nullptr, (DWORD)SetBootProtocolComplete);
+}
+
 // Etape 3 : le nom du peripherique est arrive. Simple drapeau, la conversion
 // UTF-16 -> ASCII se fait dans le thread de polling.
 int32_t BootProductNameComplete(DWORD deviceHandle, int32_t status) {
@@ -1833,6 +4281,7 @@ int32_t BootProductNameComplete(DWORD deviceHandle, int32_t status) {
 		ctrl->nameReady = true;
 	else
 		ctrl->nameParsed = true; // echec : on n'essaiera plus, le VID:PID sera affiche
+	RequestReportProtocolIfNeeded(ctrl);
 	return 0;
 }
 
@@ -1865,6 +4314,7 @@ int32_t BootReportDescriptorComplete(DWORD deviceHandle, int32_t status) {
 			sizeof(ctrl->nameBuf), ctrl->nameBuf, (DWORD)BootProductNameComplete);
 	} else {
 		ctrl->nameParsed = true;
+		RequestReportProtocolIfNeeded(ctrl);   // no name request: last link here
 	}
 	return 0;
 }
@@ -1923,10 +4373,29 @@ int32_t SetBootProtocolComplete(DWORD deviceHandle, int32_t status) {
 	return 0;
 }
 
+// Descriptor path, second half handed to the polling thread (see
+// FinishDescriptorInit). One device at a time (g_deviceInitBusy).
+volatile LONG g_descReady = 0;
+HidControllerExtension* volatile g_descDriver = nullptr;
+// Report descriptor buffer: static, so the USB completion callback never calls
+// calloc / free (was calloc'ed in INIT_GET_HID_DESCRIPTOR).
+static uint8_t g_reportDescStatic[4096];
+
 int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	HidControllerExtension* controllerDriver = (HidControllerExtension*)((BYTE*)deviceHandle - 36);
 	SafeDbgPrint("X360Remap: Control transfer completed.\n");
 
+	// A failed control transfer was never checked: the chain went on with an
+	// empty or garbage buffer (2026-10-23).
+	if (status < 0 && (g_InitState == InitState::INIT_SET_CONFIGURATION ||
+	                   g_InitState == InitState::INIT_GET_HID_DESCRIPTOR ||
+	                   g_InitState == InitState::INIT_GET_REPORT_DESCRIPTOR)) {
+		FileLog("Init stage %d: control transfer failed (%x) for VID:%04x PID:%04x - giving up",
+			(int)g_InitState, (unsigned int)status, c.vendorId, c.productId);
+		g_InitState = InitState::INIT_FAILED;
+		g_deviceInitBusy = false;
+		return 0;
+	}
 	if (g_InitState == InitState::INIT_SET_CONFIGURATION) {
 		g_InitState = InitState::INIT_GET_HID_DESCRIPTOR;
 		SafeDbgPrint("X360Remap: Init Stage 1. SET_CONFIGURATION completed successfully\r\n");
@@ -1968,13 +4437,8 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 			g_deviceInitBusy = false;
 			return 0;
 		}
-		reportDescriptorBuffer = calloc(1, hidDescriptorBuffer.wDescriptorLength);
-		if (!reportDescriptorBuffer) {
-			FileLog("InitStage2 descriptor allocation failed - giving up");
-			g_InitState = InitState::INIT_FAILED;
-			g_deviceInitBusy = false;
-			return 0;
-		}
+		memset(g_reportDescStatic, 0, sizeof(g_reportDescStatic));
+		reportDescriptorBuffer = g_reportDescStatic;   // no heap here (USB completion context)
 
 		SendControlRequest(
 			controllerDriver->deviceHandle,
@@ -1988,166 +4452,213 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 			(DWORD)setConfigurationComplete);
 	}
 	else if (g_InitState == InitState::INIT_GET_REPORT_DESCRIPTOR) {
-		SafeDbgPrint("X360Remap: Init Stage 3. INIT_GET_REPORT_DESCRIPTOR completed successfully %x\r\n",
-			*(DWORD*)reportDescriptorBuffer);
-		FileLog("InitStage3 report descriptor received, parsing it now");
-
-		// Parse HID descriptor
-		HID_ReportInfo_t* reportInfo = nullptr;
-		uint8_t parseResult = USB_ProcessHIDReport((const uint8_t*)reportDescriptorBuffer,
-			hidDescriptorBuffer.wDescriptorLength,
-			&reportInfo);
-
-		if (parseResult != HID_PARSE_Successful || !reportInfo) {
-			SafeDbgPrint("X360Remap: Failed to parse HID descriptor: error %d\r\n", parseResult);
-			FileLog("Failed to parse HID descriptor: error %d", parseResult);
-			g_InitState = InitState::INIT_FAILED;
-			g_deviceInitBusy = false;
-			free(reportDescriptorBuffer);
-			return -1;
-		}
-
-		SafeDbgPrint("X360Remap: parse done stage 1\r\n");
-		g_InitState = InitState::INIT_DONE;
-
-		c.reportInfo = reportInfo;
-		c.reportId = FindGamepadReportId(reportInfo);
-		c.isMouse = DetectIsMouse(reportInfo, c.reportId);
-		c.mouseAccumX = 0;
-		c.mouseAccumY = 0;
-		c.mouseWheelAccum = 0;
-		c.wheelPulseDir = 0;
-		c.wheelPulseUntilMs = 0;
-		c.cursorAccumX = 0;
-		c.cursorAccumY = 0;
-		c.smoothedVelX = 0.0f;
-		c.smoothedVelY = 0.0f;
-		// GetTickCount() maintenant, pas 0 - un premier calcul d'ecart avec 0
-		// donnerait un "elapsedMs" enorme (des millions de ms) au tout premier
-		// poll, ce qui ferait decroitre l'inertie a neant immediatement au
-		// lieu de simplement demarrer a 0 (aucun mouvement accumule encore de
-		// toute facon, donc l'effet est cosmetique, mais plus propre ainsi).
-		c.lastVelocityUpdateMs = GetTickCount();
-		// A keyboard has no relative X axis, so it will never be classified as a
-		// mouse - the isMouse check here is just defensive, not a real conflict.
-		c.isKeyboard = !c.isMouse && DetectIsKeyboard(reportInfo);
-
-		// CORRECTIF (2026-09-10, PREMIER JET NON TESTE SUR MATERIEL) : c.reportId
-		// a ete calcule plus haut par FindGamepadReportId, qui ne regarde QUE
-		// la page bureau generique (axes) - toujours 0 pour un clavier pur,
-		// meme quand son vrai ReportID est different. Sans cette correction,
-		// HidFillDescriptorKeyboardState (voir plus haut, FindKeySlotItem/
-		// FindModifierBitItem) filtrerait sur le mauvais ReportID et ne
-		// trouverait jamais rien. Voir FindKeyboardReportId juste apres
-		// FindGamepadReportId pour le detail.
-		if (c.isKeyboard && reportInfo->UsingReportIDs) {
-			c.reportId = FindKeyboardReportId(reportInfo);
-		}
-
-		SafeDbgPrint("X360Remap: Parsed descriptor. UsingReportIDs: %d, Report ID: %d, IsMouse: %d, IsKeyboard: %d\r\n",
-			(int)reportInfo->UsingReportIDs, c.reportId, (int)c.isMouse, (int)c.isKeyboard);
-		FileLog("Parsed descriptor. VID:%04x PID:%04x UsingReportIDs:%d ReportID:%d IsMouse:%d IsKeyboard:%d",
-			c.vendorId, c.productId, (int)reportInfo->UsingReportIDs, c.reportId, (int)c.isMouse, (int)c.isKeyboard);
-
-		free(reportDescriptorBuffer);
-
-		// FILET DE SECURITE (2026-09-10, PREMIER JET NON TESTE SUR MATERIEL) :
-		// necessaire depuis que la politique d'acceptation (voir
-		// CLAIM_ONLY_SUPPORTED_DEVICES plus bas dans HidAddDeviceHook) laisse
-		// passer jusqu'ici toute interface HID-class, plus seulement celles
-		// avec un mapping deja connu. Un appareil qui s'avere n'etre ni
-		// souris, ni clavier, ni manette a mapping connu n'a rien a faire
-		// enregistre comme controleur virtuel - c'est exactement le cout
-		// "extra player" que la politique de 2026-07-31 visait a eviter (voir
-		// son commentaire). On relache proprement ICI, avant tout appel a
-		// UsbdOpenEndpoint/XamUserBindDeviceCallback (donc avant tout effet
-		// de bord), plutot que d'enregistrer un joueur fantome inutile.
-		// g_deviceInitBusy est remis a false comme sur les autres sorties
-		// anticipees de cette fonction (voir le bloc "Failed to parse HID
-		// descriptor" juste au-dessus pour le meme motif).
-		if (!c.isMouse && !c.isKeyboard && !c.map) {
-			FileLog("Descriptor parsed but VID:%04x PID:%04x is neither mouse, keyboard nor a known controller - released without registering",
-				c.vendorId, c.productId);
-			// Le descripteur analyse n'etait jamais libere ici (AUDIT M4) :
-			// une petite fuite a chaque branchement d'un appareil inconnu.
-			USB_FreeReportInfo(reportInfo);
-			c.reportInfo = nullptr;
-			g_InitState = InitState::INIT_FAILED;
-			g_deviceInitBusy = false;
-			return 0;
-		}
-
-		usb_endpoint_descriptor* endpoint_descriptor = UsbdGetEndpointDescriptor(
-			controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_IN);
-		// Jamais verifie jusqu'ici (AUDIT M4) - le chemin rapide le fait deja.
-		if (!endpoint_descriptor) {
-			FileLog("VID:%04x PID:%04x has no interrupt IN endpoint - giving up", c.vendorId, c.productId);
-			USB_FreeReportInfo(reportInfo);
-			c.reportInfo = nullptr;
-			g_InitState = InitState::INIT_FAILED;
-			g_deviceInitBusy = false;
-			return 0;
-		}
-
-		status = UsbdOpenEndpoint(
-			controllerDriver->deviceHandle,
-			3,
-			endpoint_descriptor->bEndpointAddress,
-			swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF,
-			endpoint_descriptor->bInterval,
-			(DWORD*)&controllerDriver->interruptTrb);
-
-		if (NT_ERROR(status)) {
-			SafeDbgPrint("X360Remap: Failed to open interrupt endpoint %x!\n", status);
-			FileLog("VID:%04x PID:%04x - opening the interrupt endpoint was refused (%x)", c.vendorId, c.productId, (unsigned int)status);
-			USB_FreeReportInfo(reportInfo);   // fuite corrigee (AUDIT M4)
-			c.reportInfo = nullptr;
-			g_deviceInitBusy = false;
-			return status;
-		}
-
-		FileLog("InitStage4 interrupt endpoint opened ok");
-
-		uint16_t pktSize = swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF;
-		c.reportData = malloc(pktSize * 2);
-		memset(c.reportData, 0, pktSize * 2);
-
-		controllerDriver->interruptTrb.savedEndpoint = controllerDriver->interruptTrb.endpoint; 
-		controllerDriver->interruptTrb.length = pktSize;
-		controllerDriver->interruptTrb.callback = (DWORD)interruptHandler;
-		controllerDriver->interruptTrb.buffer = c.reportData;
-
-		c.controllerDriver = controllerDriver;
-
-		uint8_t  userIndex = -1;
-		uint32_t context = 0x0000000010000005 + globalIndex;
-		FileLog("InitStage5 calling XamUserBindDeviceCallback (idx=%d)", globalIndex);
-		XamUserBindDeviceCallback(0xa7553952 + globalIndex, context, 0, false, &userIndex);
-		FileLog("InitStage6 XAM bind returned, slot=%d", (int)userIndex);
-		c.userIndex = userIndex;
-		c.deviceContext = context;
-		connectedControllers[globalIndex] = c;
-
-		SafeDbgPrint("X360Remap: Registered virtual controller inside XAM with index: %d.\n", userIndex);
-
-		if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
-			SafeDbgPrint("X360Remap: Sending dualshock3 handshake!\r\n");
-			SendControlRequest(controllerDriver->deviceHandle,
-				&controllerDriver->controlTrb,
-				0x21,
-				0x09, 
-				Ds3FeatureStartDevice, 
-				0, 
-				sizeof(DS3_HANDSHAKE), 
-				(void*)DS3_HANDSHAKE, 
-				(DWORD)noopCompleteHandler);
-		}
-		g_deviceInitBusy = false;
-		FileLog("InitStage7 init complete, queueing first interrupt transfer");
-		return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
+		// Report descriptor received. Everything else (parsing - dozens of
+		// heap allocations -, classification, opening the interrupt endpoint,
+		// XAM registration, buffer allocation) now runs in the POLLING THREAD
+		// (2026-10-23): HB's 0079:0006 pad froze the console only with the
+		// plugin, and only through this path (disable_generic_hid.txt = no
+		// freeze). This callback runs in the USB completion context, where
+		// the C runtime heap must not be used (same lesson as the 2026-10-12
+		// key-press freeze) - the boot path already parsed in the polling thread.
+		FileLog("InitStage3 report descriptor received - finishing in the polling thread");
+		g_descDriver = controllerDriver;
+		MemoryBarrier();
+		g_descReady = 1;
 	}
 
 	return 0;
+}
+
+// Second half of the descriptor-path init (see INIT_GET_REPORT_DESCRIPTOR
+// above), called from MappingManagerThreadProc only.
+static int32_t FinishDescriptorInit(HidControllerExtension* controllerDriver) {
+	NTSTATUS status = 0;
+	SafeDbgPrint("X360Remap: Init Stage 3. INIT_GET_REPORT_DESCRIPTOR completed successfully %x\r\n",
+		*(DWORD*)reportDescriptorBuffer);
+	FileLog("InitStage3 report descriptor received, parsing it now");
+
+	// Parse HID descriptor
+	HID_ReportInfo_t* reportInfo = nullptr;
+	uint8_t parseResult = USB_ProcessHIDReport((const uint8_t*)reportDescriptorBuffer,
+		hidDescriptorBuffer.wDescriptorLength,
+		&reportInfo);
+
+	if (parseResult != HID_PARSE_Successful || !reportInfo) {
+		SafeDbgPrint("X360Remap: Failed to parse HID descriptor: error %d\r\n", parseResult);
+		FileLog("Failed to parse HID descriptor: error %d", parseResult);
+		g_InitState = InitState::INIT_FAILED;
+		g_deviceInitBusy = false;
+		return -1;
+	}
+
+	SafeDbgPrint("X360Remap: parse done stage 1\r\n");
+	g_InitState = InitState::INIT_DONE;
+
+	c.reportInfo = reportInfo;
+	c.reportId = FindGamepadReportId(reportInfo);
+	c.isMouse = DetectIsMouse(reportInfo, c.reportId);
+	c.mouseAccumX = 0;
+	c.mouseAccumY = 0;
+	c.mouseWheelAccum = 0;
+	c.wheelPulseDir = 0;
+	c.wheelPulseUntilMs = 0;
+	c.cursorAccumX = 0;
+	c.cursorAccumY = 0;
+	c.smoothedVelX = 0.0f;
+	c.smoothedVelY = 0.0f;
+	// GetTickCount() maintenant, pas 0 - un premier calcul d'ecart avec 0
+	// donnerait un "elapsedMs" enorme (des millions de ms) au tout premier
+	// poll, ce qui ferait decroitre l'inertie a neant immediatement au
+	// lieu de simplement demarrer a 0 (aucun mouvement accumule encore de
+	// toute facon, donc l'effet est cosmetique, mais plus propre ainsi).
+	c.lastVelocityUpdateMs = GetTickCount();
+	// A keyboard has no relative X axis, so it will never be classified as a
+	// mouse - the isMouse check here is just defensive, not a real conflict.
+	c.isKeyboard = !c.isMouse && DetectIsKeyboard(reportInfo);
+
+	// CORRECTIF (2026-09-10, PREMIER JET NON TESTE SUR MATERIEL) : c.reportId
+	// a ete calcule plus haut par FindGamepadReportId, qui ne regarde QUE
+	// la page bureau generique (axes) - toujours 0 pour un clavier pur,
+	// meme quand son vrai ReportID est different. Sans cette correction,
+	// HidFillDescriptorKeyboardState (voir plus haut, FindKeySlotItem/
+	// FindModifierBitItem) filtrerait sur le mauvais ReportID et ne
+	// trouverait jamais rien. Voir FindKeyboardReportId juste apres
+	// FindGamepadReportId pour le detail.
+	if (c.isKeyboard && reportInfo->UsingReportIDs) {
+		c.reportId = FindKeyboardReportId(reportInfo);
+	}
+
+	SafeDbgPrint("X360Remap: Parsed descriptor. UsingReportIDs: %d, Report ID: %d, IsMouse: %d, IsKeyboard: %d\r\n",
+		(int)reportInfo->UsingReportIDs, c.reportId, (int)c.isMouse, (int)c.isKeyboard);
+	FileLog("Parsed descriptor. VID:%04x PID:%04x UsingReportIDs:%d ReportID:%d IsMouse:%d IsKeyboard:%d",
+		c.vendorId, c.productId, (int)reportInfo->UsingReportIDs, c.reportId, (int)c.isMouse, (int)c.isKeyboard);
+
+
+	// FILET DE SECURITE (2026-09-10, PREMIER JET NON TESTE SUR MATERIEL) :
+	// necessaire depuis que la politique d'acceptation (voir
+	// CLAIM_ONLY_SUPPORTED_DEVICES plus bas dans HidAddDeviceHook) laisse
+	// passer jusqu'ici toute interface HID-class, plus seulement celles
+	// avec un mapping deja connu. Un appareil qui s'avere n'etre ni
+	// souris, ni clavier, ni manette a mapping connu n'a rien a faire
+	// enregistre comme controleur virtuel - c'est exactement le cout
+	// "extra player" que la politique de 2026-07-31 visait a eviter (voir
+	// son commentaire). On relache proprement ICI, avant tout appel a
+	// UsbdOpenEndpoint/XamUserBindDeviceCallback (donc avant tout effet
+	// de bord), plutot que d'enregistrer un joueur fantome inutile.
+	// g_deviceInitBusy est remis a false comme sur les autres sorties
+	// anticipees de cette fonction (voir le bloc "Failed to parse HID
+	// descriptor" juste au-dessus pour le meme motif).
+	// Controllers known in advance (SDL Game Controller Database, see
+	// known_controllers.h): mapped now, no controller assistant. Only when
+	// nothing else maps it - X360Remap.json and the built-in mappings win.
+	if (!c.isMouse && !c.isKeyboard && !c.map) {
+		uint16_t descAxes[16];
+		uint8_t nDescAxes = 0;
+		for (HID_ReportItem_t* it = reportInfo->FirstReportItem; it && nDescAxes < 16; it = it->Next) {
+			if (it->ItemType != HID_REPORT_ITEM_In) continue;
+			if (it->Attributes.Usage.Page != HID_USAGE_PAGE_GENERIC_DESKTOP) continue;
+			if (reportInfo->UsingReportIDs && it->ReportID != c.reportId) continue;
+			descAxes[nDescAxes++] = it->Attributes.Usage.Usage;
+		}
+		const char* knownName = nullptr;
+		c.map = AttachKnownController(c.vendorId, c.productId, descAxes, nDescAxes, &knownName);
+		if (c.map) {
+			FileLog("Known controller VID:%04x PID:%04x \"%s\" (SDL GameControllerDB) - %d axes, %d buttons mapped",
+				c.vendorId, c.productId, knownName ? knownName : "?",
+				(int)c.map->axisMapCount, (int)c.map->buttonMapCount);
+		} else if (knownName) {
+			FileLog("Known controller VID:%04x PID:%04x \"%s\" but the list is full - the controller assistant will start",
+				c.vendorId, c.productId, knownName);
+		}
+	}
+
+	if (!c.isMouse && !c.isKeyboard && !c.map && DetectIsGamepad(reportInfo)) {
+		// Unknown controller: kept, the controller assistant starts from
+		// the polling thread (it needs a device with reportInfo and no map).
+		FileLog("Unknown controller VID:%04x PID:%04x - kept, the controller assistant will start",
+			c.vendorId, c.productId);
+	}
+	if (!c.isMouse && !c.isKeyboard && !c.map && !DetectIsGamepad(reportInfo)) {
+		FileLog("Descriptor parsed but VID:%04x PID:%04x is neither mouse, keyboard nor a controller - released without registering",
+			c.vendorId, c.productId);
+		// Le descripteur analyse n'etait jamais libere ici (AUDIT M4) :
+		// une petite fuite a chaque branchement d'un appareil inconnu.
+		USB_FreeReportInfo(reportInfo);
+		c.reportInfo = nullptr;
+		g_InitState = InitState::INIT_FAILED;
+		g_deviceInitBusy = false;
+		return 0;
+	}
+
+	usb_endpoint_descriptor* endpoint_descriptor = UsbdGetEndpointDescriptor(
+		controllerDriver->deviceHandle, 0, USB_ENDPOINT_TYPE_INTERRUPT, USB_DIRECTION_IN);
+	// Jamais verifie jusqu'ici (AUDIT M4) - le chemin rapide le fait deja.
+	if (!endpoint_descriptor) {
+		FileLog("VID:%04x PID:%04x has no interrupt IN endpoint - giving up", c.vendorId, c.productId);
+		USB_FreeReportInfo(reportInfo);
+		c.reportInfo = nullptr;
+		g_InitState = InitState::INIT_FAILED;
+		g_deviceInitBusy = false;
+		return 0;
+	}
+
+	status = UsbdOpenEndpoint(
+		controllerDriver->deviceHandle,
+		3,
+		endpoint_descriptor->bEndpointAddress,
+		swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF,
+		endpoint_descriptor->bInterval,
+		(DWORD*)&controllerDriver->interruptTrb);
+
+	if (NT_ERROR(status)) {
+		SafeDbgPrint("X360Remap: Failed to open interrupt endpoint %x!\n", status);
+		FileLog("VID:%04x PID:%04x - opening the interrupt endpoint was refused (%x)", c.vendorId, c.productId, (unsigned int)status);
+		USB_FreeReportInfo(reportInfo);   // fuite corrigee (AUDIT M4)
+		c.reportInfo = nullptr;
+		g_deviceInitBusy = false;
+		return status;
+	}
+
+	controllerDriver->openedDataEp = controllerDriver->interruptTrb.endpoint;   // for the clean unplug
+	FileLog("InitStage4 interrupt endpoint opened ok");
+
+	uint16_t pktSize = swap_endianness_16(endpoint_descriptor->wMaxPacketSize) & 0x7FF;
+	c.reportData = malloc(pktSize * 2);
+	memset(c.reportData, 0, pktSize * 2);
+
+	controllerDriver->interruptTrb.savedEndpoint = controllerDriver->interruptTrb.endpoint; 
+	controllerDriver->interruptTrb.length = pktSize;
+	controllerDriver->interruptTrb.callback = (DWORD)interruptHandler;
+	controllerDriver->interruptTrb.buffer = c.reportData;
+
+	c.controllerDriver = controllerDriver;
+
+	uint8_t  userIndex = -1;
+	uint32_t context = 0x0000000010000005 + globalIndex;
+	FileLog("InitStage5 calling XamUserBindDeviceCallback (idx=%d)", globalIndex);
+	XamUserBindDeviceCallback(0xa7553952 + globalIndex, context, 0, false, &userIndex);
+	FileLog("InitStage6 XAM bind returned, slot=%d", (int)userIndex);
+	c.userIndex = userIndex;
+	c.deviceContext = context;
+	connectedControllers[globalIndex] = c;
+
+	SafeDbgPrint("X360Remap: Registered virtual controller inside XAM with index: %d.\n", userIndex);
+
+	if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
+		SafeDbgPrint("X360Remap: Sending dualshock3 handshake!\r\n");
+		SendControlRequest(controllerDriver->deviceHandle,
+			&controllerDriver->controlTrb,
+			0x21,
+			0x09, 
+			Ds3FeatureStartDevice, 
+			0, 
+			sizeof(DS3_HANDSHAKE), 
+			(void*)DS3_HANDSHAKE, 
+			(DWORD)noopCompleteHandler);
+	}
+	g_deviceInitBusy = false;
+	FileLog("InitStage7 init complete, queueing first interrupt transfer");
+	return UsbdQueueAsyncTransfer(controllerDriver->deviceHandle, &controllerDriver->interruptTrb);
 }
 
 uint8_t NormalizeHat(int32_t v) {
@@ -2320,6 +4831,29 @@ void HidFillButtonsReport(
 			out->*entry.field = (uint8_t)item->Value;
 		}
 	}
+
+	// Macros: only which pad buttons are held here; XInputdReadStateHook plays them,
+	// it is called at each game read, so the steps follow the game's own timing.
+	out->macroHeld = 0;
+	for (uint8_t i = 0; i < map->macroCount && i < MAX_MACROS; i++) {
+		HID_ReportItem_t* item = FindButtonItem(info, map->macros[i].idx, reportId);
+		if (item && USB_GetHIDReportItemInfo(reportId, payload, item) && item->Value) out->macroHeld |= (uint16_t)(1u << i);
+	}
+
+	// Held buttons for the Studio's controller page (input_state.json "padBtn").
+	// Only while the Studio runs: costs a pass over the report items.
+	// shortcut: the last pad to report wins, enough for one USB pad; per pad when the Studio shows two.
+	if (g_studioActive) {
+		uint32_t held = 0;
+		for (HID_ReportItem_t* it = info->FirstReportItem; it; it = it->Next) {
+			if (it->ItemType != HID_REPORT_ITEM_In || it->Attributes.Usage.Page != HID_USAGE_PAGE_BUTTON) continue;
+			if (info->UsingReportIDs && it->ReportID != reportId) continue;
+			const uint16_t usage = it->Attributes.Usage.Usage;
+			if (usage >= 1 && usage <= 32 && USB_GetHIDReportItemInfo(reportId, payload, it) && it->Value)
+				held |= 1u << (usage - 1);
+		}
+		g_padButtonsHeld = held;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,6 +4888,23 @@ bool DetectIsMouse(HID_ReportInfo_t* info, uint8_t reportId) {
 // N-key array or a bitmap of individual key usages, depending on the
 // device. We don't parse any of that yet, just detect its presence so the
 // device can be classified and kept out of the gamepad mapping assistant.
+// An unknown controller (2026-10-14, HB's generic USB pad was "not detected"):
+// at least 4 buttons on the Button page, or 2 absolute axes on the Generic
+// Desktop page. Such a device is kept so the controller assistant can map it.
+bool DetectIsGamepad(HID_ReportInfo_t* info) {
+	if (!info) return false;
+	int buttons = 0, axes = 0;
+	for (HID_ReportItem_t* item = info->FirstReportItem; item; item = item->Next) {
+		if (item->ItemType != HID_REPORT_ITEM_In) continue;
+		if (item->Attributes.Usage.Page == HID_USAGE_PAGE_BUTTON) buttons++;
+		if (item->Attributes.Usage.Page == HID_USAGE_PAGE_GENERIC_DESKTOP &&
+			!(item->ItemFlags & HID_IOF_RELATIVE) &&
+			item->Attributes.Usage.Usage >= HID_USAGE_AXIS_X && item->Attributes.Usage.Usage <= HID_USAGE_AXIS_RZ)
+			axes++;
+	}
+	return buttons >= 4 || axes >= 2;
+}
+
 bool DetectIsKeyboard(HID_ReportInfo_t* info) {
 	for (HID_ReportItem_t* item = info->FirstReportItem; item; item = item->Next) {
 		if (item->ItemType != HID_REPORT_ITEM_In)
@@ -2388,22 +4939,33 @@ void HidFillDescriptorKeyboardState(const uint8_t* payload, Controller* ctrl) {
 	uint8_t reportId = ctrl->reportId;
 	if (!info) return;   // defensif - ne devrait jamais arriver ici (voir isBootProtocol dans le dispatcher)
 
+	// Two layouts exist on the keyboard page (2026-10-11):
+	//  - ARRAY (boot style, 6KRO): each item is a slot whose VALUE is a key code.
+	//  - BITMAP (N-key rollover, gaming keyboards): one 1-bit VARIABLE item per
+	//    key, whose USAGE is the key code and value 1 = held.
+	// The old code read only array slots 0-7 by usage number, so on a bitmap
+	// keyboard it saw just the bits of codes 0-7 and reported "1" as the key.
 	uint8_t pressedCode = 0xFF;
-	for (uint8_t slot = 0; slot < 8 && pressedCode == 0xFF; slot++) {
-		HID_ReportItem_t* item = FindKeySlotItem(info, slot, reportId);
-		if (item && USB_GetHIDReportItemInfo(reportId, payload, item) && item->Value != 0)
-			pressedCode = (uint8_t)item->Value;
+	uint8_t mods = 0;
+	for (HID_ReportItem_t* item = info->FirstReportItem; item; item = item->Next) {
+		if (item->ItemType != HID_REPORT_ITEM_In) continue;
+		if (item->Attributes.Usage.Page != HID_USAGE_PAGE_KEYBOARD_KEYPAD) continue;
+		if (info->UsingReportIDs && item->ReportID != reportId) continue;
+		if (!USB_GetHIDReportItemInfo(reportId, payload, item)) continue;
+		const bool bitmap = (item->ItemFlags & HID_IOF_VARIABLE) && item->Attributes.BitSize == 1;
+		const uint16_t code = bitmap ? item->Attributes.Usage.Usage : (uint16_t)item->Value;
+		if (bitmap && !item->Value) continue;
+		if (code >= 0xE0 && code <= 0xE7) { mods |= (uint8_t)(1 << (code - 0xE0)); continue; }
+		if (code > 3 && code < 0xE0 && pressedCode == 0xFF) pressedCode = (uint8_t)code;   // 1-3 = rollover/error codes
 	}
 	if (pressedCode == 0xFF) {
-		for (uint8_t bit = 0; bit < 8; bit++) {
-			HID_ReportItem_t* item = FindModifierBitItem(info, bit, reportId);
-			if (item && USB_GetHIDReportItemInfo(reportId, payload, item) && item->Value) {
-				pressedCode = 0xE0 + bit;
-				break;
-			}
-		}
+		for (uint8_t bit = 0; bit < 8; bit++)
+			if ((mods >> bit) & 1) { pressedCode = 0xE0 + bit; break; }
 	}
+	ctrl->lastModifiers = mods;
 	ctrl->lastKeyCode = pressedCode;
+	g_overlayMods = mods;
+	g_overlayKeys[0] = pressedCode;   // shortcut: one key at a time on this path, enough for keyboards seen so far
 }
 
 // Accumulates relative X/Y motion into the owning Controller (drained in
@@ -2478,6 +5040,7 @@ void HidFillMouseState(
 		}
 		ctrl->lastMouseButtonIdx = pressedIdx;
 		ctrl->lastMouseButtonsMask = mask;
+		g_overlayMouse = mask;
 	}
 
 	// Cliche brut du dernier rapport pour l'assistant de calibration
@@ -2506,6 +5069,11 @@ void HidFillMouseState(
 			g_rawMouseLatest[i] = payload[i];
 		g_rawMouseSeq++;
 	}
+
+	// Studio open: the click belongs to the cursor. As a pad button it reaches
+	// ImGui first (input_state.json comes later), presses the selected item and
+	// the button under the cursor never gets the click (HB, 2026-10-30).
+	if (g_studioActive) return;
 
 	// buttonMap du profil actif fusionne par-dessus celui du device (2026-08-03,
 	// voir ResolveMergedButtonMap) - une entree de profil surcharge le meme idx,
@@ -2791,6 +5359,12 @@ void HidFillBootMouseState(const uint8_t* payload, ButtonsReport* out, Controlle
 	// app's cursor needs "is left held" as a continuous boolean, which the
 	// single-index field above can't give once more than one button is down.
 	ctrl->lastMouseButtonsMask = buttonsByte;
+	g_overlayMouse = buttonsByte;
+
+	// Studio open: the click belongs to the cursor. As a pad button it reaches
+	// ImGui first (input_state.json comes later), presses the selected item and
+	// the button under the cursor never gets the click (HB, 2026-10-30).
+	if (g_studioActive) return;
 
 	// buttonMap du profil actif fusionne par-dessus celui du device (2026-08-03,
 	// voir ResolveMergedButtonMap) - lier un seul bouton via la liaison rapide
@@ -2868,7 +5442,10 @@ void HidFillBootKeyboardState(const uint8_t* payload, ButtonsReport* out, Contro
 			if ((r->modifiers >> bit) & 1) { pressedCode = 0xE0 + bit; break; }
 		}
 	}
+	ctrl->lastModifiers = r->modifiers;
 	ctrl->lastKeyCode = pressedCode;
+	g_overlayMods = r->modifiers;
+	for (int i = 0; i < 6; i++) g_overlayKeys[i] = r->keycodes[i];
 
 	// A "keys" layout in X360Remap.json replaces the default entirely. Le keyMap
 	// du profil actif, lui, est FUSIONNE par-dessus celui du device depuis le
@@ -2879,13 +5456,24 @@ void HidFillBootKeyboardState(const uint8_t* payload, ButtonsReport* out, Contro
 	// dans le fichier, simplement masquee en jeu).
 	HidKeyMapEntry effKeyMap[MAX_MERGED_KEYS];
 	uint8_t effKeyCount = ResolveMergedKeyMap(map, g_lastTitleId, effKeyMap, MAX_MERGED_KEYS);
-	if (effKeyCount > 0) {
+	const bool keypad = IsKnownKeypad(ctrl->vendorId, ctrl->productId);
+	if (effKeyCount > 0 || keypad) {
+		// Custom keys exist: they go ON TOP of the default layout instead of
+		// replacing it (2026-10-11, see ResolveEffectiveKeyMap) - one key
+		// assigned in the Studio no longer makes every other key dead.
+		effKeyCount = ResolveEffectiveKeyMap(map, g_lastTitleId, effKeyMap, MAX_MERGED_KEYS);
+		// Gaming keypad: START / Guide / R3 / RT on keys it really has.
+		effKeyCount = AddKeypadPreset(ctrl->vendorId, ctrl->productId, effKeyMap, effKeyCount, MAX_MERGED_KEYS);
 		out->has_hat_switch = true;
 		out->hatSwitch = HatSwitch::HAT_NEUTRAL;
+		bool enterAssigned = false;
 		for (uint8_t i = 0; i < effKeyCount; i++) {
+			if (effKeyMap[i].code == HID_KEY_ENTER) enterAssigned = true;
 			if (IsKeyPressed(r, effKeyMap[i].code))
 				ApplyKeyAction(out, effKeyMap[i].action);
 		}
+		// Enter = A when the player did not use Enter (see the default branch).
+		if (!enterAssigned && IsKeyPressed(r, HID_KEY_ENTER)) out->a_button = 1;
 		return;
 	}
 
@@ -2900,7 +5488,10 @@ void HidFillBootKeyboardState(const uint8_t* payload, ButtonsReport* out, Contro
 	if (IsKeyPressed(r, HID_KEY_I))      out->rz = 32767;
 	else if (IsKeyPressed(r, HID_KEY_K)) out->rz = -32768;
 
-	out->a_button = IsKeyPressed(r, HID_KEY_SPACE);   // saut
+	// Enter = A as well (2026-10-11): in the Studio and in every menu, a new
+	// player presses Enter to confirm. With Space only, the tester's keyboard
+	// "did nothing" in the Studio and he thought it had frozen.
+	out->a_button = IsKeyPressed(r, HID_KEY_SPACE) || IsKeyPressed(r, HID_KEY_ENTER);   // saut / valider
 	out->b_button = IsKeyPressed(r, HID_KEY_C);       // accroupi
 	out->x_button = IsKeyPressed(r, HID_KEY_R);       // recharger
 	out->y_button = IsKeyPressed(r, HID_KEY_E);       // interagir / utiliser
@@ -2986,8 +5577,13 @@ volatile int g_pollPhaseMax = 0;
 volatile DWORD g_pollHeartbeatMs = 0;
 
 static void MarkPollPhase(int phase) {
+	// A step that took long names itself (2026-11-12: a 3.4 s hole at 21.8 s in a good boot,
+	// at the very second where the frozen boots stop).
+	const DWORD markNow = GetTickCount();
+	if (g_pollHeartbeatMs != 0 && markNow - g_pollHeartbeatMs > 400)
+		FileLog("Stall: %u ms from phase %d to phase %d", (unsigned int)(markNow - g_pollHeartbeatMs), (int)g_pollPhase, phase);
 	g_pollPhase = phase;
-	g_pollHeartbeatMs = GetTickCount();
+	g_pollHeartbeatMs = markNow;
 	if (phase > g_pollPhaseMax)
 		g_pollPhaseMax = phase;
 }
@@ -2997,7 +5593,7 @@ static void MarkPollPhase(int phase) {
 // quand son nom arrive - le descripteur de chaine est asynchrone et repond
 // souvent apres la notification. AddKnownDevice ne renvoie true que si quelque
 // chose a change, donc le fichier n'est reecrit que lorsque c'est utile.
-static void UpdateKnownDevicesFile(uint16_t vid, uint16_t pid, bool isMouse, const char* name) {
+static void UpdateKnownDevicesFile(uint16_t vid, uint16_t pid, bool isMouse, const char* name, bool isPad = false) {
 	// Un peripherique reel a toujours un VID non nul. Une entree 0000:0000
 	// provient forcement d'un emplacement pas encore renseigne, et polluait la
 	// liste de selection d'un choix fantome impossible a identifier - constate
@@ -3013,7 +5609,7 @@ static void UpdateKnownDevicesFile(uint16_t vid, uint16_t pid, bool isMouse, con
 	devIn.close();
 
 	std::vector<KnownDeviceEntry> knownDevices = ParseKnownDevices(devContent);
-	if (!AddKnownDevice(&knownDevices, vid, pid, isMouse, name))
+	if (!AddKnownDevice(&knownDevices, vid, pid, isMouse, name, isPad))
 		return; // rien de neuf
 
 	std::ofstream devOut(devPath, std::ios::binary | std::ios::trunc);
@@ -3074,33 +5670,98 @@ static void RebindControllerMaps() {
 // vert"). Format : "k:046d:c33a;m:1532:0067" (k = clavier, m = souris), vide
 // si rien. Avant, la Studio deduisait "branche" de la simple fraicheur de
 // input_state.json - vraie des qu'UN des deux etait branche.
+// A USB pad the plugin drives (not a keyboard or a mouse).
+static bool AnyUsbPad() {
+	for (int i = 0; i < 4; i++) {
+		const Controller& c = connectedControllers[i];
+		if (c.controllerDriver && !c.isKeyboard && !c.isMouse) return true;
+	}
+	return false;
+}
+
+// While the Studio runs: a pad known only from the built-in or SDL lists gets
+// its mapping written to X360Remap.json once, so the Studio can edit it.
+// Polling thread only; same detach / load / save / rebind steps as F9.
+static void SaveBuiltInPadMappings() {
+	static uint32_t s_done[8];
+	static int s_doneCount = 0;
+	for (int i = 0; i < 4; i++) {
+		const Controller& c = connectedControllers[i];
+		if (!c.controllerDriver || c.isKeyboard || c.isMouse || !c.map || IsDynamicMapping(c.map)) continue;
+		const uint32_t key = ((uint32_t)c.vendorId << 16) | c.productId;
+		bool done = false;
+		for (int k = 0; k < s_doneCount; k++) done = done || s_done[k] == key;
+		if (done || s_doneCount >= 8) continue;
+		s_done[s_doneCount++] = key;
+		DetachControllerMaps();
+		bool ok = LoadMappingsForUpdateStudio();
+		const HidDeviceMapping* builtIn = ok ? FindMapping((uint16_t)(key >> 16), (uint16_t)key) : nullptr;
+		if (builtIn && !IsDynamicMapping(builtIn)) {
+			AddDynamicCopy(*builtIn);
+			ok = SaveMappingsToStudioConfig();
+			if (ok) RememberOwnJsonWrite();
+		}
+		RebindControllerMaps();
+		FileLog(ok ? "Pad %04x:%04x: built-in mapping written to X360Remap.json for the Studio"
+		           : "Pad %04x:%04x: X360Remap.json unreadable or not written - nothing changed",
+		        (unsigned int)(key >> 16), (unsigned int)(key & 0xFFFF));
+		return;   // one per pass
+	}
+}
+
 static void FormatConnectedDevices(char* out, int cap) {
 	int p = 0;
 	out[0] = '\0';
 	for (int i = 0; i < 4 && p < cap - 16; i++) {
 		const Controller& c = connectedControllers[i];
-		if (!c.controllerDriver || (!c.isKeyboard && !c.isMouse))
+		if (!c.controllerDriver)
 			continue;
+		const char kind = c.isKeyboard ? 'k' : c.isMouse ? 'm' : 'c';   // c = USB controller (2026-11-03)
 		int w = _snprintf(out + p, cap - p - 1, "%s%c:%04x:%04x", p ? ";" : "",
-		                  c.isKeyboard ? 'k' : 'm', (unsigned int)c.vendorId, (unsigned int)c.productId);
+		                  kind, (unsigned int)c.vendorId, (unsigned int)c.productId);
 		if (w <= 0) break;
 		p += w;
 	}
 	out[cap - 1] = '\0';
 }
 
+// Logs the raw key reports captured by interruptHandler (see Controller::keyRaw).
+// Polling thread only - this is where FileLog is safe.
+static void LogCapturedKeyReports() {
+	for (int i = 0; i < 4; i++) {
+		Controller& c = connectedControllers[i];
+		if (!c.controllerDriver) continue;
+		while (c.keyRawLogged < c.keyRawCount && c.keyRawLogged < 8) {
+			MemoryBarrier();
+			const uint8_t* r = c.keyRaw[c.keyRawLogged];
+			const int n = c.reportSize < 16 ? (int)c.reportSize : 16;
+			char hex[16 * 3 + 1];
+			int p = 0;
+			for (int b = 0; b < n && p < (int)sizeof(hex) - 3; b++) {
+				const char* d = "0123456789ABCDEF";
+				hex[p++] = d[r[b] >> 4]; hex[p++] = d[r[b] & 15]; hex[p++] = ' ';
+			}
+			hex[p] = '\0';
+			FileLog("Key report VID:%04x PID:%04x %hs interface: %hs", c.vendorId, c.productId,
+				c.isExtraKeyboardIf ? "EXTRA" : "boot", hex);
+			c.keyRawLogged++;
+		}
+	}
+}
+
 static void WriteInputStateSnapshot() {
+	if (g_studioDriveIsOwnLink) return;   // see g_studioDriveIsOwnLink
 	int firstKeyboard = -1, firstMouse = -1;
 	for (int i = 0; i < 4; i++) {
 		if (!connectedControllers[i].controllerDriver)
 			continue;
-		if (connectedControllers[i].isKeyboard && firstKeyboard == -1) firstKeyboard = i;
+		if (connectedControllers[i].isKeyboard && !connectedControllers[i].isExtraKeyboardIf && firstKeyboard == -1) firstKeyboard = i;
 		if (connectedControllers[i].isMouse && firstMouse == -1)       firstMouse = i;
 	}
-	if (firstKeyboard == -1 && firstMouse == -1)
+	if (firstKeyboard == -1 && firstMouse == -1 && !AnyUsbPad())
 		return;
 
-	uint8_t keyRaw = (firstKeyboard != -1) ? connectedControllers[firstKeyboard].lastKeyCode : 0xFF;
+	uint8_t keyRaw = AnyKeyboardKeyCode();
 	uint8_t mouseRaw = (firstMouse != -1) ? connectedControllers[firstMouse].lastMouseButtonIdx : 0xFF;
 	int keyCode = (keyRaw == 0xFF) ? -1 : (int)keyRaw;
 	int mouseButton = (mouseRaw == 0xFF) ? -1 : (int)mouseRaw;
@@ -3135,11 +5796,11 @@ static void WriteInputStateSnapshot() {
 
 	char devs[80];
 	FormatConnectedDevices(devs, sizeof(devs));
-	char json[448];
+	char json[512];
 	int len = _snprintf(json, sizeof(json),
-		"{ \"keyCode\": %d, \"mouseButton\": %d, \"mouseDX\": %ld, \"mouseDY\": %ld, \"mouseButtons\": %d, \"wheelDelta\": %ld, \"rawLen\": %d, \"raw\": \"%hs\", \"rawSeq\": %lu, \"tick\": %lu, \"devs\": \"%hs\" }",
+		"{ \"keyCode\": %d, \"mouseButton\": %d, \"mouseDX\": %ld, \"mouseDY\": %ld, \"mouseButtons\": %d, \"wheelDelta\": %ld, \"rawLen\": %d, \"raw\": \"%hs\", \"rawSeq\": %lu, \"tick\": %lu, \"devs\": \"%hs\", \"padBtn\": \"0x%04lx\" }",
 		keyCode, mouseButton, (long)mouseDX, (long)mouseDY, mouseButtonsMask, (long)wheelDelta,
-		(int)g_rawMouseLen, rawHex, (unsigned long)g_rawMouseSeq, GetTickCount(), devs);
+		(int)g_rawMouseLen, rawHex, (unsigned long)g_rawMouseSeq, GetTickCount(), devs, (unsigned long)g_padButtonsHeld);
 	if (len > 0) {
 		char statePath[128];
 		StudioPath(statePath, sizeof(statePath), "input_state.json");
@@ -3149,8 +5810,283 @@ static void WriteInputStateSnapshot() {
 	}
 }
 
+// --- X360Remap_status.json (2026-10-23, CONTRACT.md) -----------------------
+// The truth about the console for the Studio and the Windows app: plugin
+// version, devices plugged in NOW, game, direct aim, players mode. Written
+// every 2 s from the polling thread only, and only while someone reads it:
+//   - the Studio runs (studio_active.flag), or
+//   - a PC is linked: pc_link.flag whose CONTENT changed in the last 10 s
+//     (the Windows app rewrites it every few seconds; content, not the file
+//     time, so the console and PC clocks never matter).
+// Nothing is written when nobody reads it (flash wear, see AUDIT I1).
+static bool PcLinkActive() {
+	static char  s_last[64];
+	static int   s_lastLen = -1;
+	static DWORD s_changedAt = 0;
+	char path[128];
+	StudioPath(path, sizeof(path), "pc_link.flag");
+	char buf[64];
+	int n = -1;
+	{
+		std::ifstream f(path, std::ios::binary);
+		if (f.is_open()) {
+			f.read(buf, sizeof(buf));
+			n = (int)f.gcount();
+		}
+	}
+	const DWORD now = GetTickCount();
+	if (n < 0) { s_lastLen = -1; return false; }          // no file: no PC
+	if (s_lastLen < 0) {
+		// First sight of the file: remember it, but a file left over from an
+		// old session is not a link - only a CHANGE afterwards is.
+		memcpy(s_last, buf, n); s_lastLen = n;
+		return false;
+	}
+	if (n != s_lastLen || memcmp(buf, s_last, n) != 0) {
+		memcpy(s_last, buf, n); s_lastLen = n;
+		s_changedAt = now;
+	}
+	return s_changedAt != 0 && (now - s_changedAt) < 10000;
+}
+
+static int JsonEscapeAscii(char* out, int cap, const char* in) {
+	int p = 0;
+	for (int i = 0; in && in[i] && p < cap - 3; i++) {
+		const unsigned char ch = (unsigned char)in[i];
+		if (ch == '"' || ch == '\\') { out[p++] = '\\'; out[p++] = (char)ch; }
+		else if (ch >= 0x20 && ch < 0x7F) out[p++] = (char)ch;
+	}
+	out[p] = '\0';
+	return p;
+}
+
+static void WriteStatusFile() {
+	if (g_studioDriveIsOwnLink) return;   // see g_studioDriveIsOwnLink
+	char json[2048];
+	int p = 0;
+	const uint32_t title = g_lastTitleId;
+	char tv[24] = "";
+	if (title != 0) {
+		const uint32_t v = GetTitleVersion();
+		if (v) _snprintf(tv, sizeof(tv) - 1, "%u.%u.%u.%u", (unsigned)(v >> 28), (unsigned)((v >> 24) & 0xF),
+			(unsigned)((v >> 8) & 0xFFFF), (unsigned)(v & 0xFF));
+		tv[sizeof(tv) - 1] = 0;
+	}
+	const DWORD now = GetTickCount();
+	const char* aim = "off";
+	char aimName[96] = "";
+	const int mb = g_mousehookBuild;
+	const int li = g_learnedActiveIdx;
+	if (mb >= 0) { aim = "builtin"; JsonEscapeAscii(aimName, sizeof(aimName), kCodBuilds[mb].name); }
+	else if (li >= 0 && li < g_learnedCount && (now - g_learnedActiveTick) < 3000) {
+		aim = "learned"; JsonEscapeAscii(aimName, sizeof(aimName), g_learned[li].name);
+	}
+	const bool real = g_realPadTick != 0 && (now - g_realPadTick) < 3000;
+	p += _snprintf(json + p, sizeof(json) - p - 1,
+		"{\r\n  \"format\": 1,\r\n  \"plugin\": \"%s\",\r\n  \"dashboard\": %d,\r\n  \"uptimeMs\": %lu,\r\n"
+		"  \"title\": \"%08x\",\r\n  \"titleVersion\": \"%s\",\r\n  \"directAim\": \"%s\",\r\n  \"directAimName\": \"%s\",\r\n"
+		"  \"players\": \"%s\",\r\n  \"paused\": %s,\r\n  \"realController\": %s,\r\n"
+		"  \"logBuffer\": \"%08x\",\r\n  \"logBufferLen\": \"%08x\",\r\n  \"devices\": [",
+		X360REMAP_VERSION, (int)XboxKrnlVersion->Build, (unsigned long)now,
+		(unsigned int)title, tv, aim, aimName,
+		g_playersSeparate ? "separate" : "merged", g_remapPaused ? "true" : "false", real ? "true" : "false",
+		(unsigned int)(uintptr_t)g_logBuffer, (unsigned int)(uintptr_t)&g_logBufferLen);
+	bool first = true;
+	for (int i = 0; i < 4 && p < (int)sizeof(json) - 200; i++) {
+		const Controller& c = connectedControllers[i];
+		if (!c.controllerDriver || c.isExtraKeyboardIf) continue;
+		char name[64];
+		JsonEscapeAscii(name, sizeof(name), c.productName);
+		const char* kind = c.isKeyboard ? "keyboard" : (c.isMouse ? "mouse" : "controller");
+		p += _snprintf(json + p, sizeof(json) - p - 1,
+			"%s\r\n    { \"vid\": \"%04x\", \"pid\": \"%04x\", \"name\": \"%s\", \"kind\": \"%s\", \"slot\": %d, \"mapped\": %s }",
+			first ? "" : ",", (unsigned int)c.vendorId, (unsigned int)c.productId, name, kind,
+			(int)(c.userIndex == 0xFF ? -1 : c.userIndex), c.map ? "true" : "false");
+		first = false;
+	}
+	if (p < (int)sizeof(json) - 16) p += _snprintf(json + p, sizeof(json) - p - 1, "%s]\r\n}\r\n", first ? "" : "\r\n  ");
+	json[sizeof(json) - 1] = 0;
+	if (p <= 0 || p >= (int)sizeof(json)) return;
+	char path[128];
+	StudioPath(path, sizeof(path), "X360Remap_status.json");
+	std::ofstream f(path, std::ios::binary | std::ios::trunc);
+	if (f.is_open()) f.write(json, p);
+}
+
+// Ctrl + the key left of 1 (HID 0x35, "²" on AZERTY) starts or stops NetISO's clip
+// recorder: it polls rec_toggle.txt and deletes it once read (X360_NetISO_Aurora/docs/
+// video-capture-design.md, "Recorder contract"). Polling thread only.
+static void RecordHotkey() {
+	static bool s_down = false;
+	static DWORD s_last = 0;
+	const bool down = (AnyKeyboardModifiers() & 0x11) != 0 && HudKeyDown(0x35);
+	const bool pressed = down && !s_down;
+	s_down = down;
+	if (!pressed || (GetTickCount() - s_last) < 1000) return;
+	s_last = GetTickCount();
+	char path[64];
+	_snprintf(path, sizeof(path) - 1, "%s\\NetISO", g_studioDrive);
+	path[sizeof(path) - 1] = '\0';
+	if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;   // no recorder module on this console
+	strcat(path, "\\rec_toggle.txt");
+	if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;   // the last one is not read yet
+	HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f == INVALID_HANDLE_VALUE) { FileLog("Record shortcut: could not create %s", path); return; }
+	DWORD written = 0;
+	WriteFile(f, "toggle", 6, &written, NULL);
+	CloseHandle(f);
+	FileLog("Record shortcut: Ctrl+0x35, rec_toggle.txt written");
+}
+
+static void HudShowToast(const char* text) {
+	const int next = !g_hudToastSet;
+	strncpy(g_hudToast[next], text, sizeof(g_hudToast[next]) - 1);
+	g_hudToast[next][sizeof(g_hudToast[next]) - 1] = '\0';
+	MemoryBarrier();
+	g_hudToastSet = next;
+	g_hudToastUntil = GetTickCount() + 4000;
+}
+
+#include "record_toast.h"
+
+// Reads the recorder's state once a second in a game, so a recording started by
+// Ctrl + 2 or by the PC is announced on screen. Polling thread only.
+static void RecordToast() {
+	static DWORD s_last = 0;
+	static char s_prev[96] = "";
+	static bool s_first = true;
+	if (!g_hudGameReady || (GetTickCount() - s_last) < 1000) return;
+	s_last = GetTickCount();
+	char path[64];
+	_snprintf(path, sizeof(path) - 1, "%s\\NetISO\\rec_state.txt", g_studioDrive);
+	path[sizeof(path) - 1] = '\0';
+	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f == INVALID_HANDLE_VALUE) return;
+	char cur[96] = "";
+	DWORD got = 0;
+	ReadFile(f, cur, sizeof(cur) - 1, &got, NULL);
+	CloseHandle(f);
+	cur[got] = '\0';
+	for (char* c = cur; *c; c++) if (*c == '\r' || *c == '\n') { *c = '\0'; break; }
+	char text[56];
+	RecordToastText(s_prev, cur, text, sizeof(text), g_pluginLang == LANG_FR);
+	strcpy(s_prev, cur);
+	if (s_first) { s_first = false; return; }   // an old state from before this game
+	if (text[0]) HudShowToast(text);
+}
+
+// Direct aim settings for the overlay, twice a second. Upper case only: the font has no more.
+static void UpdateHudLines() {
+	{   // Guide open: no drawing now and for 1.5 s after (see g_hudUiQuietUntil)
+		typedef BOOL (*XamIsUIActiveFn)();
+		static XamIsUIActiveFn s_uiActive = NULL;
+		static bool s_resolved = false;
+		if (!s_resolved) {
+			s_resolved = true;
+			HANDLE xam = GetModuleHandleA("xam.xex");
+			PVOID p = NULL;
+			if (xam && XexGetProcedureAddress(xam, 748, &p) == 0) s_uiActive = (XamIsUIActiveFn)p;
+			FileLog("Overlay: Guide check %s", s_uiActive ? "on" : "unavailable");
+		}
+		if (s_uiActive && s_uiActive()) g_hudUiQuietUntil = GetTickCount() + 1500;
+	}
+	static DWORD s_title = 0, s_titleSince = 0;
+	if (g_lastTitleId != s_title) { s_title = g_lastTitleId; s_titleSince = GetTickCount(); g_hudGameReady = false; }
+	if (IsGameTitle(s_title) && (GetTickCount() - s_titleSince) > 15000) g_hudGameReady = true;
+
+	// The shortcut alone shows or hides the keyboard / controller drawing: for the
+	// Windows key, a combo (Win+Shift+X) does not.
+	static bool s_keyDown = false, s_keyAlone = false;
+	const uint8_t mods = AnyKeyboardModifiers();
+	const bool isWin = g_hudHotkey == 0xE3;
+	const bool keyDown = isWin ? (mods & 0x88) != 0 : HudKeyDown((uint8_t)g_hudHotkey);
+	if (keyDown && !s_keyDown) s_keyAlone = true;
+	if (isWin && keyDown && ((mods & ~0x88) != 0 || AnyKeyboardKeyCode() < 0xE0)) s_keyAlone = false;
+	if (!keyDown && s_keyDown && s_keyAlone) g_hudInputShown = !g_hudInputShown;
+	s_keyDown = keyDown;
+	// Shortcut + I shows or hides the console info line (HB, 2026-11-16). Until the
+	// next Studio save, which reloads show_stats.
+	static bool s_iDown = false;
+	const bool iDown = keyDown && HudKeyDown(0x0C);   // HID usage 0x0C = I
+	if (iDown && !s_iDown) g_hudShowStats = !g_hudShowStats;
+	s_iDown = iDown;
+
+	static DWORD s_last = 0;
+	const DWORD now = GetTickCount();
+	if ((now - s_last) < 500) return;
+	s_last = now;
+	const HidDeviceMapping* map = nullptr;
+	for (int i = 0; i < 4 && !map; i++)
+		if (connectedControllers[i].controllerDriver && connectedControllers[i].isMouse) map = connectedControllers[i].map;
+	EffectiveMouseSettings e = ResolveEffectiveMouseSettings(map, g_lastTitleId);
+	ApplyLiveOverrides(e, g_lastTitleId);
+	const bool learned = g_learnedActiveIdx >= 0 && g_learnedActiveIdx < g_learnedCount && (now - g_learnedActiveTick) < 3000;
+	static char s_old[HUD_LINES][HUD_LINE_CHARS];
+	// shortcut: French or English only (Portuguese and Spanish get English), the panel font has no accents.
+	const bool fr = g_pluginLang == LANG_FR;
+	const bool aimOn = g_mousehookBuild >= 0 || learned;
+	_snprintf(g_hudLines[0], HUD_LINE_CHARS - 1, fr ? "VISEE: %s" : "DIRECT AIM: %s", aimOn ? (fr ? "ACTIVE" : "ON") : "OFF");
+	_snprintf(g_hudLines[1], HUD_LINE_CHARS - 1, "SENS: %d", (int)e.mouseSensitivity);
+	_snprintf(g_hudLines[2], HUD_LINE_CHARS - 1, "ADS: %d%%", (int)(e.adsSensitivity ? e.adsSensitivity : 100));
+	_snprintf(g_hudLines[3], HUD_LINE_CHARS - 1, fr ? "LISSAGE: %d MS" : "SMOOTHING: %d MS", (int)e.directAimSmoothingMs);
+	_snprintf(g_hudLines[4], HUD_LINE_CHARS - 1, fr ? "TRANSITION: %d MS" : "ADS RAMP: %d MS", (int)e.adsRampMs);
+	_snprintf(g_hudLines[5], HUD_LINE_CHARS - 1, fr ? "ZONE MORTE: %d" : "DEADZONE: %d", (int)e.deadzone);
+	_snprintf(g_hudLines[6], HUD_LINE_CHARS - 1, fr ? "ANTI-ZONE: %d" : "ANTI-DEADZONE: %d", (int)e.antiDeadzone);
+	if (memcmp(s_old, g_hudLines, sizeof(s_old)) != 0) {
+		memcpy(s_old, g_hudLines, sizeof(s_old));
+		g_hudInfoUntil = now + g_hudInfoSecs * 1000;
+	}
+
+	static DWORD s_lastFps = 0, s_lastTemps = 0;
+	static int s_cpu = -1, s_gpu = -1;
+	// In a game only, never at boot: the read came in with the boot hangs of 2026-10-30.
+	if (g_hudShowStats && !g_hudNoTemps && g_hudGameReady && (now - s_lastTemps) >= 5000) {
+		s_lastTemps = now;
+		ReadSmcTemps(&s_cpu, &s_gpu);
+	}
+	if ((now - s_lastFps) >= 1000) {
+		const LONG frames = InterlockedExchange(&g_hudFrames, 0);
+		char line[sizeof(g_hudStats)];
+		int n = _snprintf(line, sizeof(line) - 1, "FPS %d", (int)(frames * 1000 / (LONG)(now - s_lastFps)));
+		if (s_cpu > 0 && n > 0) _snprintf(line + n, sizeof(line) - 1 - n, "   CPU %dC   GPU %dC", s_cpu, s_gpu);
+		line[sizeof(line) - 1] = '\0';
+		memcpy(g_hudStats, line, sizeof(line));
+		s_lastFps = now;
+	}
+
+	// The player's own keys: what is saved in the Studio, or the default layout.
+	const HidDeviceMapping* keys = nullptr;
+	for (int i = 0; i < 4 && !keys; i++)
+		if (connectedControllers[i].controllerDriver && connectedControllers[i].isKeyboard &&
+			!connectedControllers[i].isExtraKeyboardIf) keys = connectedControllers[i].map;
+	static HidKeyMapEntry s_map[MAX_MERGED_KEYS];
+	const uint8_t mapped = ResolveMergedKeyMap(keys, g_lastTitleId, s_map, MAX_MERGED_KEYS);
+	static const HidKeyMapEntry kDefault[] = {
+		{0x1A, KEYACT_LSTICK_UP}, {0x04, KEYACT_LSTICK_LEFT}, {0x16, KEYACT_LSTICK_DOWN}, {0x07, KEYACT_LSTICK_RIGHT},
+		{0x2C, KEYACT_A}, {0x06, KEYACT_B}, {0x15, KEYACT_X}, {0x08, KEYACT_Y}, {0x14, KEYACT_LB}, {0x09, KEYACT_RB},
+		{0xE1, KEYACT_LT}, {0xE0, KEYACT_RT},
+	};
+	uint8_t codes[MAX_MERGED_KEYS], actions[MAX_MERGED_KEYS];
+	int count = 0;
+	if (mapped == 0)
+		for (size_t i = 0; i < sizeof(kDefault) / sizeof(kDefault[0]); i++) { codes[count] = kDefault[i].code; actions[count++] = kDefault[i].action; }
+	for (int i = 0; i < mapped; i++) { codes[count] = s_map[i].code; actions[count++] = s_map[i].action; }
+	const int next = !g_hudCapSet;
+	int w = 0, h = 0;
+	g_hudCapCount[next] = HudLayout(codes, actions, count, g_hudCaps[next], 420, g_hudStyle ? 60 : 0, g_hudStyle ? 38 : 35, &w, &h);
+	g_hudBlockW = (DWORD)w;
+	const DWORD blockHeight = h > 112 ? (DWORD)h : 112;
+	g_hudBlockY = g_hudKeysY + blockHeight > 712 ? 712 - blockHeight : g_hudKeysY;
+	MemoryBarrier();
+	g_hudCapSet = next;
+}
+
 unsigned int __stdcall MappingThreadProc(void* param);
 unsigned int __stdcall MappingManagerThreadProc(void* param){
+	PollStackPaint();
+	FileLog("Polling thread stack: %u KB (base %08x, limit %08x)%hs",
+		(unsigned int)((g_pollStackBase - ThreadStackLimit()) / 1024), (unsigned int)g_pollStackBase,
+		(unsigned int)ThreadStackLimit(), g_pollStackLimit ? "" : " - not measured");
 	// One-time init: connectedControllers[] starts zero-initialized (global
 	// array), which would otherwise make lastKeyCode/lastMouseButtonIdx read
 	// as 0 (a real HID code / button index) instead of the "nothing pressed"
@@ -3197,6 +6133,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 		// une fois le delai de securite ecoule (voir QueueDriverFree). Doit
 		// rester dans ce thread : jamais depuis un callback USB.
 		DrainDriverFreeQueue();
+		LogCapturedKeyReports();
 
 		// Idem pour le flush disque force (voir g_forceFlushRequested) : un
 		// callback USB peut le demander, seul ce thread l'execute reellement.
@@ -3218,12 +6155,40 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 		// disque immediatement. Apres cette minute, retour au rythme normal :
 		// aucun cout sur une session longue.
 		DWORD sinceBoot = GetTickCount() - g_bootBlackoutStartedAt;
-		bool fineGrained = (sinceBoot < 60000);
+		// Also while the Studio runs (2026-10-30): the "freeze with the Studio
+		// open" logs stopped at the last 30 s flush, so they could not tell a
+		// frozen console from a Studio that hung while the plugin lived on.
+		LogOverlayProbe(g_lastTitleId);
+		if (g_overlayProbe && g_hudEnabled) UpdateHudLines();
+		RecordHotkey();
+		if (g_overlayProbe && g_hudEnabled) RecordToast();
+		bool fineGrained = (sinceBoot < 60000) || g_studioActive;
+		// Kernel 17559 only: its display mode number (FREEZE_STATIC_ANALYSIS.md). -1 means
+		// the HDMI screen changed or a fatal error is being shown; the kernel faults on it.
+		if (XboxKrnlVersion->Build == 17559) {
+			static DWORD lastVideoMode = 0xFFFFFFFE;
+			const DWORD videoMode = *(volatile DWORD*)0x80170D84;
+			if (videoMode != lastVideoMode) {
+				FileLog("Video mode %d -> %d (EDID sum %08x)", (int)lastVideoMode, (int)videoMode,
+					(unsigned int)*(volatile DWORD*)0x801839D4);
+				lastVideoMode = videoMode;
+			}
+		}
 		if ((GetTickCount() - lastHeartbeatMs) >= (fineGrained ? 1000 : 30000)) {
 			lastHeartbeatMs = GetTickCount();
+			// No SMC temperatures here: that read came in with the boot hangs,
+			// a console shutdown and a game freeze of 2026-10-30. Off until proven.
 			FileLog("Heartbeat polling: alive (phase=%d, max phase=%d, titleId=%08x, USB error stops=%u)",
 				(int)g_pollPhase, (int)g_pollPhaseMax, (unsigned int)g_lastTitleId,
 				(unsigned int)g_interruptErrorStops);
+			{
+				static DWORD s_deepest = 0;
+				const DWORD deep = PollStackDeepest();
+				if (deep > s_deepest + 512) {
+					s_deepest = deep;
+					FileLog("Stack: deepest %u of %u bytes", (unsigned int)deep, (unsigned int)(g_pollStackBase - g_pollStackLimit));
+				}
+			}
 			if (fineGrained)
 				FlushLogBuffer();   // chaque seconde compte : sur le disque tout de suite
 			g_pollPhaseMax = 0;
@@ -3304,7 +6269,18 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 					m ? m->mouseSensitivity : 0,
 					(int)connectedControllers[i].userIndex);
 				FlushLogBuffer();
-				XNotifyUI(XNOTIFYUI_CUSTOM, msg);
+				// No "mouse detected" pop-up for the mouse PART of a keyboard /
+				// keypad (Tartarus wheel, 2026-10-12): the player saw "mouse
+				// detected" twice for one real mouse. Same VID:PID as a keyboard
+				// already connected = part of that device.
+				bool partOfKeyboard = false;
+				for (int k = 0; k < 4; k++)
+					if (k != i && connectedControllers[k].controllerDriver && connectedControllers[k].isKeyboard &&
+						connectedControllers[k].vendorId == connectedControllers[i].vendorId &&
+						connectedControllers[k].productId == connectedControllers[i].productId)
+						partOfKeyboard = true;
+				if (!partOfKeyboard)
+					XNotifyUI(XNOTIFYUI_CUSTOM, msg);
 
 				// Jalon 8 (suite, demande utilisateur 2026-08-03) - persiste ce
 				// VID/PID dans known_devices.txt pour que l'ecran de selection
@@ -3326,6 +6302,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 			// built on top of it.
 			if (connectedControllers[i].controllerDriver &&
 				connectedControllers[i].isKeyboard &&
+				!connectedControllers[i].isExtraKeyboardIf &&
 				!connectedControllers[i].keyboardNotified) {
 				connectedControllers[i].keyboardNotified = true;
 
@@ -3345,6 +6322,15 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 				UpdateKnownDevicesFile(connectedControllers[i].vendorId,
 					connectedControllers[i].productId, false,
 					connectedControllers[i].productName);
+			}
+
+			// A USB pad is listed too (type C), with its SDL name until the USB name arrives.
+			if (connectedControllers[i].controllerDriver && !connectedControllers[i].isMouse &&
+				!connectedControllers[i].isKeyboard && !connectedControllers[i].padListed) {
+				connectedControllers[i].padListed = true;
+				const KnownControllerEntry* kc = FindKnownController(connectedControllers[i].vendorId, connectedControllers[i].productId);
+				const char* name = connectedControllers[i].productName[0] ? connectedControllers[i].productName : kc ? kc->name : "";
+				UpdateKnownDevicesFile(connectedControllers[i].vendorId, connectedControllers[i].productId, false, name, true);
 			}
 
 			// Check if controller exists, has reportInfo, but no mapping, and mapping not already in progress.
@@ -3390,6 +6376,23 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 		// once real DbgPrint visibility is available (Xbox 360 Neighborhood /
 		// VS remote attach) - iterating blind on this specific problem via
 		// hardware test cycles alone has not been reliable.
+		// Descriptor path (gamepads and other non-boot HID): second half of the
+		// init, handed over by setConfigurationComplete (2026-10-23).
+		if (g_descReady) {
+			g_descReady = 0;
+			MemoryBarrier();
+			HidControllerExtension* d = g_descDriver;
+			g_descDriver = nullptr;
+			if (d) {
+				__try { FinishDescriptorInit(d); }
+				__except (EXCEPTION_EXECUTE_HANDLER) {
+					FileLog("EXCEPTION FinishDescriptorInit: code=%08x - device given up", (unsigned int)GetExceptionCode());
+					g_InitState = InitState::INIT_FAILED;
+					g_deviceInitBusy = false;
+				}
+			}
+		}
+
 		// --- Parsing du descripteur de rapport (2026-08-03) ----------------
 		// Le callback USB s'est contente de poser un drapeau ; le travail lourd
 		// (USB_ProcessHIDReport, parseur LUFA) se fait ICI, dans le seul
@@ -3438,7 +6441,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 				// AddKnownDevice ne renvoie true que s'il y a du nouveau, donc
 				// pas de reecriture inutile.
 				UpdateKnownDevicesFile(nc.vendorId, nc.productId,
-					nc.isMouse, nc.productName);
+					nc.isMouse, nc.productName, !nc.isMouse && !nc.isKeyboard);
 			}
 		}
 
@@ -3523,8 +6526,9 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 			MemoryBarrier();
 			dc.isBootProtocol = false;
 
-			FileLog("HID descriptor parsed for VID:%04x PID:%04x (len=%d reportId=%d) - native reading on, wheel included",
-				dc.vendorId, dc.productId, (int)dc.reportDescLen, (int)rid);
+			FileLog("HID descriptor parsed for VID:%04x PID:%04x (len=%d reportId=%d) - native reading on, wheel included%hs",
+				dc.vendorId, dc.productId, (int)dc.reportDescLen, (int)rid,
+				dc.reportProtocolRequested ? ", SET_PROTOCOL(report) sent" : "");
 		}
 
 		MarkPollPhase(2);
@@ -3572,7 +6576,9 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 			g_titleZeroCandidateSince = 0; // annule un debounce "retour dashboard" en cours
 			if (currentTitleId != g_lastTitleId) {
 				FileLog("Title changed: %08x -> %08x (no rebind action taken)", g_lastTitleId, currentTitleId);
+			g_directAimOff = false;   // Win+Shift+D lasts one game
 				g_lastTitleId = currentTitleId;
+				if (currentTitleId != 0xFFFE07D1) LogRunningGameVersion(currentTitleId);   // exact game version, for direct aim
 				ClearStudioFlagOnTitleChange();   // AUDIT I1
 				g_titleStableSince = GetTickCount();
 
@@ -3613,6 +6619,7 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 				g_lastTitleId = 0;
 				g_titleStableSince = GetTickCount();
 				g_titleZeroCandidateSince = 0;
+				g_dashSinceLoad = true;
 				ClearStudioFlagOnTitleChange();   // AUDIT I1
 			}
 		}
@@ -3655,30 +6662,154 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 		MarkPollPhase(3);
 		if (!g_deferredResetDone &&
 			(GetTickCount() - g_titleStableSince) > 10000 &&
-			(GetTickCount() - g_bootBlackoutStartedAt) > 20000) {
+			(GetTickCount() - g_bootBlackoutStartedAt) > 20000 &&
+			!g_bootUsbResetInProgress && (g_blackoutEndedAt == 0 || (GetTickCount() - g_blackoutEndedAt) > 3000)) {
 
 			g_deferredResetDone = true;
 			g_bootUsbResetInProgress = false;   // devices may be claimed from now on
 
-			FileLog("Deferred USB reset: title %08x stable, re-enumerating USB now", g_lastTitleId);
-			FlushLogBuffer();   // get this on disk BEFORE the risky call, not after
+			// Test switch (2026-10-26, GitHub issue #5: Wi-Fi networks not found
+			// with the plugin loaded). The internal Wi-Fi module of the Slim / E
+			// is a USB device, so a full USB reset may leave the network stack
+			// without its adapter. disable_usb_reset.txt skips the reset. Read
+			// HERE, not in LoadFreezeTestSettings: this runs >20 s after boot in
+			// the polling thread, so the hard drive is surely mounted.
+			bool skipUsbReset = false;
+			{
+				char rp[128];
+				StudioPath(rp, sizeof(rp), "disable_usb_reset.txt");
+				std::ifstream rin(rp, std::ios::binary);
+				if (rin.is_open()) { rin.close(); skipUsbReset = true; }
+			}
 
-			UsbdPowerDownNotification();
-			MmFreePhysicalMemory(0, *(DWORD*)UsbPhysicalPage);
-			UsbdDriverEntry();
+			if (skipUsbReset) {
+				FileLog("Deferred USB reset SKIPPED (disable_usb_reset.txt) - devices plugged at power-on may need a replug");
+				FlushLogBuffer();
+			} else {
+				FileLog("Deferred USB reset: title %08x stable, re-enumerating USB now", g_lastTitleId);
+				FlushLogBuffer();   // get this on disk BEFORE the risky call, not after
 
-			FileLog("Deferred USB reset done - devices connected at power-on should appear now");
+				UsbdPowerDownNotification();
+				MmFreePhysicalMemory(0, *(DWORD*)UsbPhysicalPage);
+				UsbdDriverEntry();
+
+				FileLog("Deferred USB reset done - devices connected at power-on should appear now");
+			}
+		}
+#else
+		// USB boot report (read only, see RunGentleUsbRescan): once, with the
+		// dashboard back from the boot title for 10 s and the claim blackout over.
+		// shortcut: no 60 s fallback if the boot title never switches back; replug then.
+		if (!g_usbRescanDone && g_dashSinceLoad && g_lastTitleId == 0 &&
+			(GetTickCount() - g_titleStableSince) > 10000 &&
+			!g_bootUsbResetInProgress && g_blackoutEndedAt != 0 &&
+			(GetTickCount() - g_blackoutEndedAt) > 3000) {
+			g_usbRescanDone = true;
+			RunGentleUsbRescan();
+		}
+		// Listed ports, once per boot, after the boot report: one every 3 s.
+		if (g_usbRescanDone && g_portResetCount != 0) {
+			if (g_portResetCount < 0) { ReadPortResetList(); g_portResetAt = GetTickCount(); }
+			else if (g_portResetNext < g_portResetCount && GetTickCount() - g_portResetAt > 3000) {
+				g_portResetAt = GetTickCount();
+				ResetNextListedPort();
+			}
+		}
+		if (g_usbRescanDone) {
+			static DWORD s_askCheck = 0;
+			bool asked = false;
+			if (GetTickCount() - s_askCheck > 2000) {
+				s_askCheck = GetTickCount();
+				char ap[128];
+				StudioPath(ap, sizeof(ap), "usb_report.txt");
+				if (GetFileAttributesA(ap) != INVALID_FILE_ATTRIBUTES) { DeleteFileA(ap); asked = true; }
+			}
+			if (asked || (g_usbReportWanted && GetTickCount() - g_usbReportWantedAt > 2000)) {
+				g_usbReportWanted = false;
+				FileLog("USB report again (%s)", asked ? "usb_report.txt" : "a device arrived");
+				RunGentleUsbRescan();
+			}
 		}
 #endif
+
+		// Guide button requested from the input hook (see g_guideRequest).
+		{
+			const LONG g = InterlockedExchange(&g_guideRequest, 0);
+			if (g > 0)
+				XamInputSendXenonButtonPress((DWORD)(g - 1));
+		}
+
+		// Working folder not found at boot (2026-10-29, see ResolveStudioDrive):
+		// retry every 2 s; after 60 s, one FINAL pass that may create the folder
+		// on internal memory / USB, then give up. Polling thread = safe context.
+		{
+			static DWORD lastStorageTryMs = 0;
+			static bool storageGaveUp = false;
+			if (!g_studioDriveResolved && !storageGaveUp && g_bootBlackoutStartedAt != 0 &&
+				(GetTickCount() - lastStorageTryMs) >= 2000) {
+				lastStorageTryMs = GetTickCount();
+				const bool finalPass = (GetTickCount() - g_bootBlackoutStartedAt) > 60000;
+				if (ResolveStudioDrive(finalPass ? STORAGE_PASS_FINAL : STORAGE_PASS_RETRY)) {
+					FileLog("Working folder found after boot: %s\\X360RemapStudio (%u ms)%hs",
+						g_studioDrive, (unsigned int)(GetTickCount() - g_bootBlackoutStartedAt),
+						g_studioDriveIsOwnLink ? " - own link: live Studio files (input_state, status) NOT written" : "");
+					// Before the blackout ends, its own re-read below loads
+					// everything. After it, load the settings here.
+					if (!g_bootUsbResetInProgress) {
+						LoadFreezeTestSettings();
+						LoadDbgPrintMirrorSetting();
+						LoadOverlaySetting();
+						LoadBootProtocolSetting();
+#if EN_CAMERA_LEARN
+						LoadLearnedCameras();
+#endif
+						if (LoadMappingsFromStudioConfig()) {
+							RebindControllerMaps();
+							g_installIncomplete = false;
+							g_configUnreadable = false;
+							FileLog("X360Remap.json loaded from the late working folder");
+						}
+					}
+					FlushLogBuffer();
+				} else if (finalPass) {
+					storageGaveUp = true;
+					FileLog("No writable storage found after 60 s (tried HDD:, Hdd1:, X360R:, OnBoardMU:, INTUSB:, Usb0:, USB sticks Mass0-2) - default layout, no log on disk");
+				}
+			}
+		}
 
 		// Close the boot blackout window once enough time has passed since the
 		// USB reset for its asynchronous enumeration to be over - see the
 		// g_bootUsbResetInProgress comment for why this is time-based and not
 		// tied to the UsbdDriverEntry() call returning.
 		if (g_bootUsbResetInProgress && g_bootBlackoutStartedAt != 0 &&
-			(GetTickCount() - g_bootBlackoutStartedAt) > BOOT_CLAIM_BLACKOUT_MS) {
+			(GetTickCount() - g_bootBlackoutStartedAt) > BOOT_CLAIM_BLACKOUT_MS &&
+			((g_lastTitleId == 0 && (GetTickCount() - g_titleStableSince) > BOOT_SETTLE_TITLE_MS) ||
+			 (GetTickCount() - g_bootBlackoutStartedAt) > BOOT_SETTLE_MAX_MS)) {
 			g_bootUsbResetInProgress = false;
+			g_blackoutEndedAt = GetTickCount();
 			FileLog("Boot blackout over - devices can be claimed from now on (replug anything connected at boot)");
+			FlushLogBuffer();   // 2026-11-12: every frozen boot stops within a second of this block;
+			                    // each step reaches the disk before the next, so a frozen log names it
+
+			// Read AGAIN now that the storage is surely mounted (2026-10-08): at
+			// DllMain the hard drive is often not ready yet ("boot read failed:
+			// storage not ready yet"), so the enable_*.txt switches and
+			// camera_addresses.txt were silently ignored - which is why the
+			// Metro switches "changed nothing".
+			LoadFreezeTestSettings(); FileLog("Blackout end step 1 done"); FlushLogBuffer();
+			// Same for the DbgPrint mirror (2026-10-23): read only at DllMain, it
+			// was ALWAYS off - the live capture with XboxFreezeLogger received
+			// nothing at all.
+			LoadDbgPrintMirrorSetting(); FileLog("Blackout end step 2 done"); FlushLogBuffer();
+			LoadOverlaySetting(); FileLog("Blackout end step 3 done"); FlushLogBuffer();
+			// Same for force_boot_protocol.txt (2026-10-29, HB's Rapoo log: "No
+			// writable storage found" at DllMain, so the file was never seen).
+			// Safe here: devices are only claimed after this blackout ends.
+			LoadBootProtocolSetting(); FileLog("Blackout end step 4 done"); FlushLogBuffer();
+#if EN_CAMERA_LEARN
+			LoadLearnedCameras(); FileLog("Blackout end step 5 done"); FlushLogBuffer();
+#endif
 
 			// Meme instant que la fin du blackout : le dashboard est affiche
 			// depuis un moment, la notification sera donc reellement visible.
@@ -3756,9 +6887,59 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 					FileLog("studio_active.flag seen - input_state.json is now only written while the Studio runs");
 				if (present)
 					g_studioFlagEverSeen = true;
+#if EN_CAMERA_LEARN
+				if (!present && g_studioActive) LoadLearnedCameras();   // a camera deleted in the Studio
+#endif
+				// Settings saved in the Studio apply when it closes. Polling thread: file read is safe here.
+				if (!present && g_studioActive && g_overlayProbe) {
+					LoadOverlayLook();
+					FileLog("Overlay settings reloaded after the Studio: enabled=%d keys=%d info=%d secs=%u hotkey=%02x",
+						(int)g_hudEnabled, (int)g_hudShowKeys, (int)g_hudShowInfo, (unsigned int)g_hudInfoSecs, (unsigned int)g_hudHotkey);
+				}
 				g_studioActive = present;
+				if (present) SaveBuiltInPadMappings();
 			}
 #endif
+
+			// X360Remap_status.json (see WriteStatusFile): every 2 s, only
+			// while a PC is linked. Not for the Studio: with this file written
+			// while it ran, the console froze within seconds, 4 times out of 4
+			// (2026-10-30), even with the Studio not reading it. Cause unknown.
+			{
+				static DWORD s_lastStatus = 0;
+				static bool s_loggedLink = false;
+				if (GetTickCount() - s_lastStatus >= 2000) {
+					s_lastStatus = GetTickCount();
+					const bool pc = PcLinkActive();
+					if (pc != s_loggedLink) {
+						s_loggedLink = pc;
+						FileLog(pc ? "PC link: pc_link.flag is being refreshed - status file on" : "PC link: gone");
+					}
+					if (pc) {
+						__try { WriteStatusFile(); }
+						__except (EXCEPTION_EXECUTE_HANDLER) {
+							FileLog("EXCEPTION WriteStatusFile: code=%08x - ignored", (unsigned int)GetExceptionCode());
+						}
+					}
+					// In-game display settings apply about 2 s after they are saved (console Studio)
+					// or sent (Windows app): the file is watched like X360Remap.json.
+					static FILETIME s_ovTime = { 0, 0 };
+					static DWORD s_ovSize = 0;
+					static bool s_ovKnown = false;
+					FILETIME ovTime; DWORD ovSize = 0;
+					if (g_overlayProbe && GetStudioFileStamp("overlay_settings.txt", &ovTime, &ovSize)) {
+						const bool ovChanged = s_ovKnown && (ovTime.dwLowDateTime != s_ovTime.dwLowDateTime ||
+							ovTime.dwHighDateTime != s_ovTime.dwHighDateTime || ovSize != s_ovSize);
+						s_ovTime = ovTime; s_ovSize = ovSize; s_ovKnown = true;
+						if (ovChanged) {
+							LoadOverlayLook();
+							FileLog("Overlay settings changed - reloaded: enabled=%d keys=%d pad=%d stats=%d hotkey=%02x draw_mode=%u",
+								(int)g_hudEnabled, (int)g_hudShowKeys, (int)g_hudShowPad, (int)g_hudShowStats, (unsigned int)g_hudHotkey,
+								(unsigned int)g_hudDrawMode);
+						}
+					}
+				}
+			}
 
 			MarkPollPhase(4);
 			FILETIME ft; DWORD sz = 0;
@@ -3802,6 +6983,8 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 
 					if (LoadMappingsFromStudioConfig()) {
 						g_jsonReloadFailures = 0;
+						g_installIncomplete = false;
+						g_configUnreadable = false;
 						RebindControllerMaps();
 						FileLog("X360Remap.json changed - mappings reloaded, no reboot needed%hs",
 							pendantDemarrage ? " (notification hidden: boot)" : "");
@@ -3857,14 +7040,14 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 				// les deux chemins, c'est le bon critere.
 				if (!connectedControllers[i].controllerDriver)
 					continue;
-				if (connectedControllers[i].isKeyboard && firstKeyboard == -1)
+				if (connectedControllers[i].isKeyboard && !connectedControllers[i].isExtraKeyboardIf && firstKeyboard == -1)
 					firstKeyboard = i;
 				if (connectedControllers[i].isMouse && firstMouse == -1)
 					firstMouse = i;
 			}
 
-			if (firstKeyboard != -1 || firstMouse != -1) {
-				uint8_t keyRaw = (firstKeyboard != -1) ? connectedControllers[firstKeyboard].lastKeyCode : 0xFF;
+			if (firstKeyboard != -1 || firstMouse != -1 || AnyUsbPad()) {
+				uint8_t keyRaw = AnyKeyboardKeyCode();
 				uint8_t mouseRaw = (firstMouse != -1) ? connectedControllers[firstMouse].lastMouseButtonIdx : 0xFF;
 				int keyCode = (keyRaw == 0xFF) ? -1 : (int)keyRaw;
 				int mouseButton = (mouseRaw == 0xFF) ? -1 : (int)mouseRaw;
@@ -3919,19 +7102,23 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 
 				char devs[80];
 				FormatConnectedDevices(devs, sizeof(devs));
-				char json[448];
+				char json[512];
 				int len = _snprintf(json, sizeof(json),
-					"{ \"keyCode\": %d, \"mouseButton\": %d, \"mouseDX\": %ld, \"mouseDY\": %ld, \"mouseButtons\": %d, \"wheelDelta\": %ld, \"rawLen\": %d, \"raw\": \"%hs\", \"rawSeq\": %lu, \"tick\": %lu, \"devs\": \"%hs\" }",
+					"{ \"keyCode\": %d, \"mouseButton\": %d, \"mouseDX\": %ld, \"mouseDY\": %ld, \"mouseButtons\": %d, \"wheelDelta\": %ld, \"rawLen\": %d, \"raw\": \"%hs\", \"rawSeq\": %lu, \"tick\": %lu, \"devs\": \"%hs\", \"padBtn\": \"0x%04lx\" }",
 					keyCode, mouseButton, (long)mouseDX, (long)mouseDY, mouseButtonsMask, (long)wheelDelta,
-					(int)g_rawMouseLen, rawHex, (unsigned long)g_rawMouseSeq, GetTickCount(), devs);
+					(int)g_rawMouseLen, rawHex, (unsigned long)g_rawMouseSeq, GetTickCount(), devs, (unsigned long)g_padButtonsHeld);
 #if EN_FIX_INPUT_STATE_ONLY_WITH_STUDIO
 				// AUDIT I1 : ecriture seulement si la Studio est presente (ou si
 				// aucune Studio recente ne s'est jamais signalee - repli).
-				const bool writeInputState = g_studioActive || !g_studioFlagEverSeen;
+				// Only while the Studio runs (2026-11-12). The old fallback "write until a Studio was
+				// seen once" meant 10 disk writes a second on every boot where the Studio was not
+				// opened, in games too: measured stalls of 0.4 to 0.8 s in this very step, and the
+				// last line before the freeze of 2026-11-12. Every Studio since pre12 creates the flag.
+				const bool writeInputState = g_studioActive;
 #else
 				const bool writeInputState = true;
 #endif
-				if (len > 0 && writeInputState) {
+				if (len > 0 && writeInputState && !g_studioDriveIsOwnLink) {
 					char statePath[128];
 					StudioPath(statePath, sizeof(statePath), "input_state.json");
 					std::ofstream f(statePath, std::ios::binary | std::ios::trunc);
@@ -4015,6 +7202,71 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 						XNotifyUI(XNOTIFYUI_CUSTOM, msg);
 					}
 				}
+				// Win + Shift + X: X360Remap on / off (see g_remapPaused).
+				{
+					static bool s_comboHeld = false;
+					const uint8_t mods = AnyKeyboardModifiers();
+					// Win (L/R) + Shift (L/R) + X, or Shift + Alt + X for keypads
+					// with no Win key (Tartarus: key 16 + thumb button + key 18).
+					const bool combo = ((mods & 0x88) || (mods & 0x44)) && (mods & 0x22) && keyCode == (int)PAUSE_KEY_X;
+					if (combo && !s_comboHeld) {
+						g_remapPaused = !g_remapPaused;
+						FileLog(g_remapPaused ? "Win+Shift+X: X360Remap PAUSED - real controller drives player 1"
+						                      : "Win+Shift+X: X360Remap ACTIVE again");
+						FlushLogBuffer();
+						XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(g_remapPaused ? STR_REMAP_PAUSED : STR_REMAP_ACTIVE));
+					}
+					s_comboHeld = combo;
+				}
+				// Win + Shift + D: direct aim off / on; Win + Shift + R: reload the settings.
+				{
+					static int s_heldKey = 0;
+					const uint8_t mods = AnyKeyboardModifiers();
+					const bool base = ((mods & 0x88) || (mods & 0x44)) && (mods & 0x22);
+					const int key = base && (keyCode == (int)AIM_KEY_D || keyCode == (int)RELOAD_KEY_R) ? keyCode : 0;
+					if (key && key != s_heldKey) {
+						if (key == (int)AIM_KEY_D) {
+							g_directAimOff = !g_directAimOff;
+							FileLog("Win+Shift+D: direct aim %hs for %08x", g_directAimOff ? "OFF" : "ON", (unsigned int)g_lastTitleId);
+							FlushLogBuffer();
+							XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(g_directAimOff ? STR_AIM_OFF : STR_AIM_ON));
+						} else {
+							// Same path as the X360Remap.json hot reload.
+							DetachControllerMaps();
+							const bool ok = LoadMappingsFromStudioConfig();
+							RebindControllerMaps();   // a failed read keeps the previous mappings: attach them again
+							LoadLearnedCameras();
+							FileLog("Win+Shift+R: settings reloaded (%hs)", ok ? "ok" : "X360Remap.json invalid");
+							FlushLogBuffer();
+							XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(ok ? STR_CONFIG_RELOADED : STR_JSON_INVALID));
+						}
+					}
+					s_heldKey = key;
+				}
+				// Scroll Lock: players merged / separate (see g_playersSeparate),
+				// kept in players_merged.txt.
+				{
+					static bool s_playersKeyHeld = false;
+					const bool down = keyCode == (int)PLAYERS_KEY;
+					if (down && !s_playersKeyHeld) {
+						g_playersSeparate = !g_playersSeparate;
+						char pp[128];
+						StudioPath(pp, sizeof(pp), "players_merged.txt");
+						if (!g_playersSeparate) {
+							std::ofstream o(pp, std::ios::binary | std::ios::trunc);
+							if (o.is_open()) o << "Players: merged (pad + keyboard / mouse = one player). Delete this file (or press Scroll Lock) to separate them again.\r\n";
+						} else {
+							DeleteFileA(pp);
+						}
+						FileLog("Scroll Lock: players %hs", g_playersSeparate ? "SEPARATE" : "MERGED");
+						FlushLogBuffer();
+						XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(g_playersSeparate ? STR_PLAYERS_SEPARATE : STR_PLAYERS_MERGED));
+					}
+					s_playersKeyHeld = down;
+				}
+#if EN_CAMERA_LEARN
+				CameraLearnPoll(keyCode);   // v1.2.1: F12 camera search, see CameraLearnRun
+#endif
 				// --- Reglages en jeu (2026-09-25), voir EN_LIVE_TUNING ---------
 				{
 					const DWORD liveNow = GetTickCount();
@@ -4149,6 +7401,29 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 					XINPUT_GAMEPAD real;
 					uint8_t realUserIndex = 0xFF;
 					bool hasReal = ReadRealControllerState(&real, &realUserIndex);
+					if (hasReal && (GetTickCount() - g_realPadTick) > 150) {   // the game is not reading it: keep the cache fresh
+						g_realPad = real;
+						MemoryBarrier();
+						g_realPadTick = GetTickCount();
+					}
+					// Diagnostic (2026-10-06, HB: "BACK + START does nothing"): one line
+					// each time the real controller appears / disappears for the
+					// quick bind, with its slot - tells at once whether the plugin
+					// sees the controller at all.
+					{
+						static int s_lastRealSlot = -2;
+						const int slot = hasReal ? (int)realUserIndex : -1;
+						if (slot != s_lastRealSlot) {
+							s_lastRealSlot = slot;
+							char ours[32]; int p = 0; ours[0] = '\0';
+							for (int k = 0; k < 4 && p < (int)sizeof(ours) - 4; k++)
+								if (connectedControllers[k].controllerDriver)
+									p += _snprintf(ours + p, sizeof(ours) - p - 1, "%d ", (int)connectedControllers[k].userIndex);
+							ours[sizeof(ours) - 1] = '\0';
+							if (hasReal) FileLog("Quick bind: real controller seen on slot %d (keyboard/mouse slots: %hs)", slot, ours);
+							else         FileLog("Quick bind: no real controller seen (keyboard/mouse slots: %hs)", ours);
+						}
+					}
 					
 					// Annule silencieusement une etape laissee en plan (utilisateur qui
 					// arme le mode puis abandonne, manette reelle debranchee en cours de
@@ -4168,6 +7443,8 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 							bool comboHeld = (real.wButtons & XINPUT_GAMEPAD_BACK) &&
 									(real.wButtons & XINPUT_GAMEPAD_START);
 							if (comboHeld) {
+								if (g_quickBindArmHoldTicks == 0)
+									FileLog("Quick bind: BACK + START held on slot %d (hold ~1.5 s)", (int)realUserIndex);
 								g_quickBindArmHoldTicks++;
 								if (g_quickBindArmHoldTicks >= QUICKBIND_ARM_HOLD_TICKS && !g_quickBindArmTriggered) {
 									g_quickBindArmTriggered = true; // requiert un relachement avant de re-declencher
@@ -4180,6 +7457,8 @@ unsigned int __stdcall MappingManagerThreadProc(void* param){
 										XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(STR_QUICKBIND_ARMED));
 									} else {
 										FileLog("Quick bind ignored (no game running)");
+										// 2026-10-06: say it on screen too - silently doing nothing looked like a bug.
+										XNotifyUI(XNOTIFYUI_CUSTOM, (PWCHAR)WTr(STR_LIVE_NEED_GAME));
 									}
 								}
 							} else {
@@ -4631,6 +7910,12 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 		g_interruptErrorStops++;
 		return 0;   // ne JAMAIS remettre en file apres une erreur
 	}
+#else
+	// 2026-10-05: same test, switched at boot by a file (see g_interruptStatusCheck).
+	if (g_interruptStatusCheck && NT_ERROR(a2)) {
+		g_interruptErrorStops++;
+		return 0;   // never re-queue after an error
+	}
 #endif
 
 	Report* report = (Report*)driverExtension->interruptTrb.buffer;
@@ -4652,6 +7937,31 @@ int interruptHandler(DWORD deviceHandle, int32_t a2) {
 	// cours de retrait. On s'arrete la.
 	if (index < 0)
 		return 0;
+
+	// Extra keyboard interface (N-key rollover / media keys, see
+	// Controller::isExtraKeyboardIf): never decoded, so it can no longer send
+	// wrong keys or overwrite the boot interface's state. Its first 4 non-empty
+	// reports go to the log, in hex, to study new layouts from testers' logs.
+	// First 8 non-empty reports of EVERY boot-path keyboard interface go to
+	// the log in hex (2026-10-11, Tartarus tester: only the thumbpad answers -
+	// this shows on which interface each key really arrives).
+	if (connectedControllers[index].isKeyboard && connectedControllers[index].isBootProtocol) {
+		Controller& xc = connectedControllers[index];
+		const uint8_t* raw = (const uint8_t*)report;
+		const int n = xc.reportSize < 16 ? (int)xc.reportSize : 16;
+		bool any = false;
+		for (int i = 0; i < n; i++) if (raw[i]) { any = true; break; }
+		// Copy only (no CRT, no log, no lock) - the polling thread logs it.
+		const uint8_t k = xc.keyRawCount;
+		if (any && k < 8) {
+			memset(xc.keyRaw[k], 0, 16);
+			for (int i = 0; i < n; i++) xc.keyRaw[k][i] = raw[i];
+			MemoryBarrier();
+			xc.keyRawCount = (uint8_t)(k + 1);
+		}
+	}
+	if (connectedControllers[index].isExtraKeyboardIf)
+		return UsbdQueueAsyncTransfer(driverExtension->deviceHandle, &driverExtension->interruptTrb);
 
 	if (NeedsNintendoHandshake(connectedControllers[index].vendorId, connectedControllers[index].productId) && connectedControllers[index].nintendo_handshake_state != DONE) {
 		if (connectedControllers[index].nintendo_handshake_state == INITIAL) {
@@ -4859,11 +8169,27 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 	}
 
 	if (!found) {
+		// Unplugged while its init waited for the polling thread: cancel it,
+		// so FinishDescriptorInit never touches a device that is gone.
+		HidControllerExtension* pending = g_descDriver;
+		if (pending && pending->deviceHandle == deviceHandle2) {
+			g_descReady = 0;
+			g_descDriver = nullptr;
+			g_InitState = InitState::INIT_FAILED;
+			g_deviceInitBusy = false;
+			FileLog("HidRemoveDevice: handle %p removed during its init - init cancelled", deviceHandle2);
+		}
 		SafeDbgPrint("X360Remap: Returning original for handle %p\n", deviceHandle2);
 		return HidRemoveDeviceDetour.GetOriginal<decltype(&HidRemoveDeviceHook)>()(deviceHandle2);
 	}
 
 	SafeDbgPrint("X360Remap: Removing controller with handle %p\n", deviceHandle2);
+	// Breadcrumb (2026-10-05): which device, which slot - and ask the polling
+	// thread to put it on disk at once, in case this unplug is the one that freezes.
+	FileLog("HidRemoveDevice: slot %d VID:%04x PID:%04x handle %p%hs", index,
+		connectedControllers[index].vendorId, connectedControllers[index].productId, deviceHandle2,
+		connectedControllers[index].isMouse ? " (mouse)" : (connectedControllers[index].isKeyboard ? " (keyboard)" : ""));
+	g_forceFlushRequested = true;
 
 	// Check if this controller is currently in mapping process and stop it
 	if (g_mappingState.active && g_mappingState.controllerIndex == index) {
@@ -4986,38 +8312,51 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 #define EN_TEST_CLOSE_DEFAULT_ENDPOINT   1   // ESSAI 2/3 EN COURS - UsbdQueueCloseDefaultEndpoint (controlTrb) : pas de transfert permanent en vol dessus, donc a priori sans le probleme ci-dessus - a verifier
 #define EN_TEST_REMOVE_DEVICE_COMPLETE   0   // ESSAI 3/3 A VENIR - UsbdRemoveDeviceComplete
 
-#if EN_TEST_CLOSE_INTERRUPT_ENDPOINT
-		FileLog("EN_TEST_CLOSE_INTERRUPT_ENDPOINT on: UsbdQueueCloseEndpoint on handle %p", deviceHandle2);
-		g_forceFlushRequested = true;   // ecriture disque faite par le thread de polling, jamais ici (voir g_forceFlushRequested) - avant l'appel risque, pas apres
-		UsbdQueueCloseEndpoint(deviceHandle2, &drv->interruptTrb);
-#endif
+		if (g_cleanUnplug) {
+			// Clean unplug (2026-10-12) - usb-audio-x360's validated recipe:
+			// 1. no more re-queue (cleanupDone is set above, interruptHandler
+			//    then returns without re-queueing the cancelled transfer);
+			// 2. close EVERY opened endpoint with its OWN close request;
+			// 3. the memory is freed only after all close callbacks + 1 s
+			//    (DrainDriverFreeQueue). UsbdRemoveDeviceComplete is still not
+			//    called (calling it here froze their console too).
+			memset(drv->closeReq, 0, sizeof(drv->closeReq));
+			LONG n = 0;
+			if (drv->openedDataEp) n++;
+			if (drv->openedDefaultEp) n++;
+			drv->closeDoneAt = 0;
+			drv->closePending = n;
+			MemoryBarrier();
+			FileLog("Clean unplug: closing %d endpoint(s) on handle %p", (int)n, deviceHandle2);
+			if (drv->openedDataEp) {
+				drv->closeReq[0].endpoint = drv->openedDataEp;
+				drv->closeReq[0].savedEndpoint = drv->openedDataEp;
+				drv->closeReq[0].callback = (DWORD)CloseDataEpComplete;
+				UsbdQueueCloseEndpoint(deviceHandle2, &drv->closeReq[0]);
+			}
+			if (drv->openedDefaultEp) {
+				drv->closeReq[1].endpoint = drv->openedDefaultEp;
+				drv->closeReq[1].savedEndpoint = drv->openedDefaultEp;
+				drv->closeReq[1].callback = (DWORD)CloseDefaultEpComplete;
+				UsbdQueueCloseDefaultEndpoint(deviceHandle2, (DWORD*)&drv->closeReq[1]);
+			}
+			deviceHandle2->driver = nullptr;
+			QueueDriverFree(drv);
+		} else {
 #if EN_TEST_CLOSE_DEFAULT_ENDPOINT
 		FileLog("EN_TEST_CLOSE_DEFAULT_ENDPOINT on: UsbdQueueCloseDefaultEndpoint on handle %p", deviceHandle2);
 		g_forceFlushRequested = true;
 		UsbdQueueCloseDefaultEndpoint(deviceHandle2, (DWORD*)&drv->controlTrb);
-#endif
-#if EN_TEST_REMOVE_DEVICE_COMPLETE
-		FileLog("EN_TEST_REMOVE_DEVICE_COMPLETE on: UsbdRemoveDeviceComplete on handle %p", deviceHandle2);
-		g_forceFlushRequested = true;
-		UsbdRemoveDeviceComplete(deviceHandle2);
-#endif
-
-#if EN_TEST_CLOSE_INTERRUPT_ENDPOINT || EN_TEST_CLOSE_DEFAULT_ENDPOINT || EN_TEST_REMOVE_DEVICE_COMPLETE
-		// Au moins un appel asynchrone de fermeture est actif : la pile USB
-		// peut encore toucher le bloc pendant un court instant apres l'appel.
-		// Liberation differee obligatoire (voir QueueDriverFree) au lieu du
-		// delete immediat.
 		deviceHandle2->driver = nullptr;
 		QueueDriverFree(drv);
 #else
-		// Comportement retenu par defaut (aucun EN_TEST_CLOSE_* actif) :
-		// suppression immediate, aucun appel Usbd*Close*/RemoveDeviceComplete
-		// - voir conclusion 2026-08-24 ci-dessus.
 		deviceHandle2->driver = nullptr;
 		delete drv;
 #endif
+		}
 
-		free(reportDataToFree);
+		if (g_deferReportFree) QueueBufferFree(reportDataToFree);   // see g_deferReportFree
+		else free(reportDataToFree);
 		FileLog("Device removed (handle %p)", deviceHandle2);
 		SafeDbgPrint("X360Remap: Removed controller with handle %p\n", deviceHandle2);
 
@@ -5054,6 +8393,8 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	// couvre deja la meme information en toute securite (jamais bloquant),
 	// et respecte le nouveau reglage par defaut (miroir DbgPrint desactive).
 	FileLog("HidAddDevice called. handle=%p", deviceHandle);
+	g_usbReportWantedAt = GetTickCount();   // port map: report again once this device settled
+	g_usbReportWanted = true;
 	usb_device_descriptor* device_descriptor = UsbdGetDeviceDescriptor(deviceHandle);
 	usb_interface_descriptor* interface_descriptor = UsbdGetInterfaceDescriptor(deviceHandle);
 
@@ -5124,6 +8465,11 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 	const uint8_t hidProtocol = interface_descriptor->bInterfaceProtocol;
 	const bool isBootMouse    = (interface_descriptor->bInterfaceClass == 0x03 && hidProtocol == USB_HID_PROTOCOL_MOUSE);
 	const bool isBootKeyboard = (interface_descriptor->bInterfaceClass == 0x03 && hidProtocol == USB_HID_PROTOCOL_KEYBOARD);
+
+	if (g_disableGenericHid && !isBootMouse && !isBootKeyboard) {
+		FileLog("VID:%04x PID:%04x left to the console (disable_generic_hid.txt)", vendorId, productId);
+		return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
+	}
 
 #if CLAIM_ONLY_SUPPORTED_DEVICES
 	if (interface_descriptor->bInterfaceClass == 0x03 && !isBootMouse && !isBootKeyboard) {
@@ -5247,6 +8593,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			FileLog("Boot device VID:%04x PID:%04x - control endpoint failed %x", vendorId, productId, st);
 			return st;
 		}
+		drv->openedDefaultEp = drv->controlTrb.trb.endpoint;   // for the clean unplug
 
 		// Force le "Boot Protocol" HID standard (SET_PROTOCOL, HID 1.11
 		// section 7.2.6) sur CE device precis, avant d'ouvrir l'endpoint
@@ -5285,6 +8632,18 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		// en mode AUTO (voir ShouldForceBootProtocol).
 		uint16_t pktSize = swap_endianness_16(ep->wMaxPacketSize) & 0x7FF;
 
+		// Keyboard interfaces (2026-10-11, see Controller::isExtraKeyboardIf):
+		//  - boot subclass (1): the real boot keyboard. Always put in boot
+		//    protocol (unless force_boot_protocol.txt = "0"): keyboards have no
+		//    wheel to lose, and this makes gaming keyboards / keypads send all
+		//    their keys here in the standard 8-byte layout.
+		//  - no boot subclass: extra interface (N-key rollover, media keys).
+		//    Claimed, never decoded.
+		const bool extraKeyboardIf = isBootKeyboard && interface_descriptor->bInterfaceSubClass != 1;
+		const bool bootKeyboardIf  = isBootKeyboard && !extraKeyboardIf;
+		bc.isExtraKeyboardIf = extraKeyboardIf;
+		bc.lastKeyCode = 0xFF;   // "no key" until a report says otherwise
+
 		// INTERRUPTEUR DE DIAGNOSTIC (2026-08-26) : gel reproductible au
 		// branchement standalone (sans xbdm/jrpc2) confirme sur la souris
 		// 0461:4E35 (le composant "normal" du combo clavier+souris, PAS la
@@ -5308,13 +8667,19 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		// appels, UsbdSecPatch, log disque), hors de portee de notre code.
 #define EN_TEST_CONTROL_REQUESTS_BOOT_MOUSE 1
 #if EN_TEST_CONTROL_REQUESTS_BOOT_MOUSE
-		if (ShouldForceBootProtocol(vendorId, productId, pktSize)) {
+		if (ShouldForceBootProtocol(vendorId, productId, pktSize) ||
+			(bootKeyboardIf && g_bootProtocolMode != BOOTPROTO_NEVER)) {
 			SendControlRequest(deviceHandle, &drv->controlTrb,
 				0x21 /* Host->Device, Class, Interface */, 0x0B /* SET_PROTOCOL */,
 				0 /* wValue: 0 = Boot Protocol */, interface_descriptor->bInterfaceNumber,
 				0, nullptr, (DWORD)SetBootProtocolComplete);
-			FileLog("SET_PROTOCOL(boot) sent to VID:%04x PID:%04x (pkt=%d) - wheel unavailable on this device",
+			FileLog(bootKeyboardIf
+				? "SET_PROTOCOL(boot) sent to VID:%04x PID:%04x (pkt=%d) - keyboard, standard key layout"
+				: "SET_PROTOCOL(boot) sent to VID:%04x PID:%04x (pkt=%d) - wheel unavailable on this device",
 				vendorId, productId, (int)pktSize);
+		} else if (extraKeyboardIf) {
+			FileLog("Extra keyboard interface VID:%04x PID:%04x if:%d (pkt=%d) - claimed, not decoded (keys come from the boot interface)",
+				vendorId, productId, (int)interface_descriptor->bInterfaceNumber, (int)pktSize);
 		} else {
 			FileLog("SET_PROTOCOL(boot) NOT sent to VID:%04x PID:%04x (pkt=%d) - native layout kept, wheel available",
 				vendorId, productId, (int)pktSize);
@@ -5330,6 +8695,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			FileLog("Boot device VID:%04x PID:%04x - interrupt endpoint failed %x", vendorId, productId, st);
 			return st;
 		}
+		drv->openedDataEp = drv->interruptTrb.endpoint;   // for the clean unplug
 
 		bc.reportSize = pktSize;
 		bc.reportData = malloc(pktSize * 2);
@@ -5496,6 +8862,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			g_deviceInitBusy = false;
 			return status;
 		}
+		controllerDriver->openedDefaultEp = controllerDriver->controlTrb.trb.endpoint;   // for the clean unplug
 
 		g_InitState = InitState::INIT_SET_CONFIGURATION;
 		SendControlRequest(
@@ -5527,6 +8894,7 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, XINPUT_STATE* pInputState, B
 	static bool loggedFirstCall = false;
 	if (!loggedFirstCall) {
 		loggedFirstCall = true;
+		if (!g_firstXamInputTick) g_firstXamInputTick = GetTickCount() | 1;
 		FileLog("HOOK: first call XamInputSetState");
 	}
 	DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pInputState, bAmplitude, bFrequency, bOffset);
@@ -5556,6 +8924,7 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 	static bool loggedFirstCall = false;
 	if (!loggedFirstCall) {
 		loggedFirstCall = true;
+		if (!g_firstXamInputTick) g_firstXamInputTick = GetTickCount() | 1;
 		FileLog("HOOK: first call XamInputGetCapabilitiesEx");
 	}
 	DWORD status = XamInputGetCapabilitiesDetour.GetOriginal<decltype(&XamInputGetCapabilitiesExHook)>()(unk, user, flags, capabilities);
@@ -5788,11 +9157,57 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 				MergeButtonsReport(&b, &connectedControllers[i].currentState);
 				if (connectedControllers[i].isMouse)
 					mouseCtrl = &connectedControllers[i];
+				Controller& k = connectedControllers[i];
+				const HidDeviceMapping* km = k.map;
+				if (km && km->macroCount && !k.isMouse && !k.isKeyboard) {
+					const DWORD now = GetTickCount();
+					for (uint8_t m = 0; m < km->macroCount && m < MAX_MACROS; m++)
+						ApplyMacroMask(&b, MacroAdvance(km->macros[m], k.macroPlay[m], now, (k.currentState.macroHeld >> m) & 1));
+				}
 			}
 		}
 
 		if (!c)
 			return ERROR_INVALID_PARAMETER;
+
+		// X360Remap paused (Win + Shift + X): player 1 = the real controller.
+		if (g_remapPaused) {
+			memset(pInputData, 0, sizeof(XINPUT_GAMEPAD));
+			if (g_realPadTick != 0 && (GetTickCount() - g_realPadTick) < 500) {
+				MemoryBarrier();
+				*pInputData = g_realPad;
+			}
+			if (pdwPacketNumber) *pdwPacketNumber = ++c->packetNumber;
+			if (unk) *unk = FALSE;
+			return STATUS_SUCCESS;
+		}
+
+		// Merged players, the real controller is player 1: this keyboard /
+		// mouse slot hands its input to the pad (read from the real-controller
+		// branch below, g_mergeInternalRead). The game gets a resting pad here,
+		// so the mouse movement is not used up by this read.
+		const bool kbmSlot = c->isMouse || c->isKeyboard;
+		// Only while the pad really receives it (g_mergeDeliveredTick): if the
+		// game stops reading the pad, this slot works normally again.
+		// Separate players: the keyboard / mouse took player 1 from the pad, so
+		// this slot plays that pad instead (g_displacedPad) - a swap, not a merge.
+		if (!g_mergeInternalRead && kbmSlot && c->userIndex != 0 &&
+			g_mergeDeliveredTick != 0 && (GetTickCount() - g_mergeDeliveredTick) < 500) {
+			if (g_playersSeparate) {
+				static XINPUT_GAMEPAD s_lastShown;
+				MemoryBarrier();
+				*pInputData = g_displacedPad;
+				if (memcmp(&s_lastShown, pInputData, sizeof(XINPUT_GAMEPAD)) != 0) {
+					s_lastShown = *pInputData;
+					++c->packetNumber;   // a new packet only when the pad changes, like a real pad
+				}
+			} else {
+				memset(pInputData, 0, sizeof(XINPUT_GAMEPAD));
+			}
+			if (pdwPacketNumber) *pdwPacketNumber = c->packetNumber;
+			if (unk) *unk = FALSE;
+			return STATUS_SUCCESS;
+		}
 
 		// Mapping de la souris lu UNE SEULE FOIS pour tout ce poll
 		// (AUDIT_2026-09.md, C4) : il etait relu jusqu'a sept fois plus bas,
@@ -5897,7 +9312,10 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 			DWORD now = GetTickCount();
 			if (now - lastPressTime >= cooldownDuration) {
 				lastPressTime = now;
-				XamInputSendXenonButtonPress(c->userIndex);
+				// Never call XAM from inside XInputdReadState (2026-10-30,
+				// Jacckii's rule: his Guide press deadlocked the console the
+				// same way). The polling thread sends it (see g_guideRequest).
+				g_guideRequest = (LONG)c->userIndex + 1;
 			}
 		}
 
@@ -5967,8 +9385,16 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 		pInputData->sThumbRY = b.rz;
 		pInputData->sThumbLX = b.x;
 		pInputData->sThumbLY = b.y;
-		pInputData->bLeftTrigger = b.rx ? b.rx : (b.l2 ? 255 : 0);
-		pInputData->bRightTrigger = b.ry ? b.ry : (b.r2 ? 255 : 0);
+		// Analog triggers: rx / ry hold -32768 (released) .. 32767 (full). The
+		// old code kept only the low byte of that value, which is right for
+		// 8-bit triggers only (DualShock 4) and random for 10- or 16-bit ones.
+		// (v + 32768) >> 8 gives the same result for 8-bit triggers. A pressed
+		// l2 / r2 (key, mouse button, digital trigger) now always means full,
+		// even when a released analog trigger is merged in.
+		pInputData->bLeftTrigger = b.rx ? (BYTE)(((int32_t)b.rx + 32768) >> 8) : 0;
+		pInputData->bRightTrigger = b.ry ? (BYTE)(((int32_t)b.ry + 32768) >> 8) : 0;
+		if (b.l2) pInputData->bLeftTrigger = 255;
+		if (b.r2) pInputData->bRightTrigger = 255;
 
 		// Use the mouse found above rather than assuming the primary device IS
 		// the mouse - with keyboard+mouse fusion the primary may well be the
@@ -6108,9 +9534,75 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 			// Visee directe Call of Duty (voir MouseHookCod) : si la version du
 			// jeu est reconnue et qu'on est en partie, le mouvement va dans la
 			// camera et plus du tout dans le stick.
-			if (MouseHookCod(g_lastTitleId, rawDx, rawDy, effective.mouseSensitivity, effective.invertMouseY)) {
+			// v1.2.1: learned cameras (camera_addresses.txt) when no built-in
+			// build matches - and the candidate being tried takes priority
+			// while the player confirms it. Nothing at all while the camera
+			// search drives the stick.
+			// Direct aim input (2026-10-13): its own smoothing, and a slower speed
+			// while aiming down sights (LT held - already decided above in
+			// pInputData). Only the direct aim path uses these.
+			int32_t aimDx = rawDx, aimDy = rawDy;
+			SmoothMouseDelta(&mouseCtrl->smoothAim, GetTickCount(), &aimDx, &aimDy, effective.directAimSmoothingMs);
+			int32_t aimSens = (effective.mouseSensitivity != 0) ? effective.mouseSensitivity : DEFAULT_MOUSE_SENSITIVITY;
+			// ADS ramp (2026-10-13, tester with years of XIM: "the speed drops
+			// instantly when I press right click, my aim feels stuck"): the
+			// factor moves from 1 (hip) to adsSensitivity % over adsRampMs, and
+			// back the same way when the button is released.
+			{
+				const float target = (effective.adsSensitivity > 0 && pInputData->bLeftTrigger > 100)
+					? (float)effective.adsSensitivity / 100.0f : 1.0f;
+				const DWORD nowMs = GetTickCount();
+				if (mouseCtrl->adsFactor <= 0.0f) mouseCtrl->adsFactor = 1.0f;   // first use
+				DWORD dt = nowMs - mouseCtrl->adsLastMs;
+				if (mouseCtrl->adsLastMs == 0 || dt > 1000) dt = 1000;
+				mouseCtrl->adsLastMs = nowMs;
+				if (effective.adsRampMs <= 0) {
+					mouseCtrl->adsFactor = target;
+				} else {
+					const float full = (float)effective.adsSensitivity / 100.0f;   // whole hip <-> ADS distance
+					float span = full > 1.0f ? full - 1.0f : 1.0f - full;
+					if (span < 0.01f) span = 0.01f;
+					const float step = span * (float)dt / (float)effective.adsRampMs;
+					if (mouseCtrl->adsFactor < target) {
+						mouseCtrl->adsFactor += step;
+						if (mouseCtrl->adsFactor > target) mouseCtrl->adsFactor = target;
+					} else if (mouseCtrl->adsFactor > target) {
+						mouseCtrl->adsFactor -= step;
+						if (mouseCtrl->adsFactor < target) mouseCtrl->adsFactor = target;
+					}
+				}
+				aimSens = (int32_t)((float)aimSens * mouseCtrl->adsFactor);
+			}
+			if (aimSens < 1) aimSens = 1;
+			int hooked = 0;
+#if EN_CAMERA_LEARN
+			if (!g_learnInject) {
+				if (g_learnTestActive)
+					hooked = MouseHookLearned(g_lastTitleId, rawDx, rawDy, effective.mouseSensitivity, effective.invertMouseY);
+				if (hooked == 0 && !g_directAimOff && MouseHookCod(g_lastTitleId, aimDx, aimDy, aimSens, effective.invertMouseY))
+					hooked = 1;
+				if (hooked == 0 && !g_directAimOff)
+					hooked = MouseHookLearned(g_lastTitleId, aimDx, aimDy, aimSens, effective.invertMouseY);
+			}
+#else
+			if (!g_directAimOff && MouseHookCod(g_lastTitleId, aimDx, aimDy, aimSens, effective.invertMouseY))
+				hooked = 1;
+#endif
+			if (hooked == 1) {
 				dx = 0; dy = 0;
 				mouseCtrl->carryX = 0; mouseCtrl->carryY = 0;
+			} else if (hooked == 2) {          // learned camera without pitch: vertical stays on the stick
+				dx = 0;
+				mouseCtrl->carryX = 0;
+			}
+			// GIMX method (1.4.2, docs/PLAN_1.4.2_GIMX.md): computed from the raw motion, before
+			// the old chain smooths it; written over the stick at the end of that chain.
+			int32_t gimxX = 0, gimxY = 0;
+			if (effective.gimxOn) {
+				const DWORD gNow = GetTickCount();
+				const DWORD gDt = mouseCtrl->gimxLastMs ? gNow - mouseCtrl->gimxLastMs : 16;
+				mouseCtrl->gimxLastMs = gNow;
+				GimxMouseToStick(effective, &mouseCtrl->gimx, dx, effective.invertMouseY ? dy : -dy, gDt, &gimxX, &gimxY);
 			}
 			SmoothMouseDelta(&mouseCtrl->smooth, GetTickCount(), &dx, &dy, effective.smoothingMs);
 			int32_t sensitivity = (effective.mouseSensitivity != 0) ? effective.mouseSensitivity : DEFAULT_MOUSE_SENSITIVITY;
@@ -6211,6 +9703,10 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 			// mouvement : priorite a la souris, exactement comme avant.
 			pInputData->sThumbRX = (scaledX != 0) ? (int16_t)scaledX : b.z;
 			pInputData->sThumbRY = (scaledY != 0) ? (int16_t)scaledY : b.rz;
+			if (effective.gimxOn) {
+				pInputData->sThumbRX = (gimxX != 0) ? (int16_t)gimxX : b.z;
+				pInputData->sThumbRY = (gimxY != 0) ? (int16_t)gimxY : b.rz;
+			}
 
 			// Scroll wheel - drained the same way as X/Y: whatever accumulated
 			// since the last poll, then reset, so this naturally acts as a
@@ -6277,6 +9773,17 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 			}
 		}
 
+#if EN_CAMERA_LEARN
+		// Camera search (v1.2.1): the plugin drives the right stick itself.
+		// Written BEFORE the stick layout below, so a Southpaw / Legacy
+		// profile moves it to the stick the game really uses for the camera.
+		if (g_learnInject) {
+			pInputData->sThumbRX = (int16_t)g_learnRX;
+			pInputData->sThumbRY = (int16_t)g_learnRY;
+			g_learnHookTick = GetTickCount();
+		}
+#endif
+
 		// Disposition des sticks du jeu (2026-09-25, voir StickLayout dans
 		// mapping.h) : permutation EN DERNIER, une fois les deux sticks
 		// entierement calcules (clavier, souris, anti-zone morte).
@@ -6287,14 +9794,203 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 				                 &pInputData->sThumbRX, &pInputData->sThumbRY, sp->stickLayout);
 		}
 
-		if (pdwPacketNumber)
-			*pdwPacketNumber = ++c->packetNumber;
+		if (g_stickReleaseRamp) {
+			// One state per virtual controller (contexts 0x10000005 + index).
+			struct RampAxis { int16_t from; DWORD since; bool ramping; int16_t last; };
+			static RampAxis s_ramp[8][2];
+			RampAxis* r = s_ramp[(dwDeviceContext - 0x10000005u) & 7u];
+			const DWORD now = GetTickCount();
+			int16_t* axis[2] = { &pInputData->sThumbLX, &pInputData->sThumbLY };
+			for (int k = 0; k < 2; k++) {
+				const int16_t target = *axis[k];
+				if (target != 0) {
+					r[k].ramping = false;
+				} else if (r[k].last != 0 && !r[k].ramping) {
+					r[k].ramping = true; r[k].from = r[k].last; r[k].since = now;   // key just released
+				}
+				if (r[k].ramping) {
+					const DWORD t = now - r[k].since;
+					if (t >= STICK_RAMP_MS) r[k].ramping = false;
+					else *axis[k] = (int16_t)((int32_t)r[k].from * (int32_t)(STICK_RAMP_MS - t) / (int32_t)STICK_RAMP_MS);
+				}
+				r[k].last = target;
+			}
+		}
+
+		// Merged players, this slot is player 1: the real controller's input
+		// is added (the pad keeps working as player 1 with the mouse too).
+		if (!g_playersSeparate && !g_mergeInternalRead && kbmSlot && c->userIndex == 0 &&
+			g_realPadTick != 0 && (GetTickCount() - g_realPadTick) < 500) {
+			MemoryBarrier();
+			XINPUT_GAMEPAD real = g_realPad;
+			MergeGamepad(pInputData, &real);
+			g_padIntoKbmTick = GetTickCount();
+		}
+
+		// OUR USB pad is player 1 (2026-11-18, HB: the Xbox sign-in window only
+		// listens to player 1, the keyboard / mouse got player 2 and was ignored).
+		// Same as for a real controller (real-controller branch below): the keyboard
+		// / mouse slot is read here. Separate: it REPLACES this pad (keyboard / mouse
+		// = player 1) and that slot plays the pad. Merged: it is added to this pad
+		// and that slot rests.
+		if (!g_mergeInternalRead && !kbmSlot && c->userIndex == 0) {
+			Controller* v = nullptr;
+			for (int i = 0; i < (int)(sizeof(connectedControllers) / sizeof(Controller)); i++) {
+				Controller& k = connectedControllers[i];
+				if (k.controllerDriver && (k.isMouse || k.isKeyboard) &&
+					k.deviceContext != dwDeviceContext && k.userIndex != 0) { v = &k; break; }
+			}
+			if (v) {
+				XINPUT_GAMEPAD virt;
+				memset(&virt, 0, sizeof(virt));
+				DWORD pkt = 0;
+				g_mergeInternalRead = true;
+				const NTSTATUS st = XInputdReadStateHook(v->deviceContext, &pkt, &virt, nullptr);
+				g_mergeInternalRead = false;
+				if (st == STATUS_SUCCESS) {
+					if (g_playersSeparate) {
+						g_displacedPad = *pInputData;
+						MemoryBarrier();
+						*pInputData = virt;
+					} else {
+						MergeGamepad(pInputData, &virt);
+					}
+					g_mergeDeliveredTick = GetTickCount();
+				}
+			}
+		}
+
+		if (g_stickRestNoise && pInputData->sThumbLX == 0 && pInputData->sThumbLY == 0) {
+			static int16_t s_rest = 300;
+			s_rest = -s_rest;
+			pInputData->sThumbLX = s_rest;
+			pInputData->sThumbLY = 300;
+		}
+
+		if (pdwPacketNumber) {
+			if (g_packetOnChange) {
+				static XINPUT_GAMEPAD s_prev[8];
+				XINPUT_GAMEPAD& prev = s_prev[(dwDeviceContext - 0x10000005u) & 7u];
+				if (memcmp(&prev, pInputData, sizeof(XINPUT_GAMEPAD)) != 0) {
+					prev = *pInputData;
+					++c->packetNumber;
+				}
+				*pdwPacketNumber = c->packetNumber;
+			} else {
+				*pdwPacketNumber = ++c->packetNumber;
+			}
+		}
 		if (unk)
 			*unk = FALSE;
 
+		if (g_inputTrace) {
+			static int16_t s_lx = 0, s_ly = 0, s_rx = 0, s_ry = 0;
+			static WORD s_btn = 0;
+			static DWORD s_lastLine = 0, s_calls = 0;
+			s_calls++;
+			const DWORD now = GetTickCount();
+			const bool changed = pInputData->sThumbLX != s_lx || pInputData->sThumbLY != s_ly ||
+				pInputData->sThumbRX != s_rx || pInputData->sThumbRY != s_ry || pInputData->wButtons != s_btn;
+			const bool held = pInputData->sThumbLX != 0 || pInputData->sThumbLY != 0;
+			if (changed || (held && (now - s_lastLine) >= 1000)) {
+				FileLog("TRACE ctx %08x pkt %lu LX %d LY %d RX %d RY %d btn %04x title %08x (%lu reads since last line)",
+					(unsigned int)dwDeviceContext, pdwPacketNumber ? (unsigned long)*pdwPacketNumber : 0ul,
+					(int)pInputData->sThumbLX, (int)pInputData->sThumbLY, (int)pInputData->sThumbRX,
+					(int)pInputData->sThumbRY, (unsigned int)pInputData->wButtons, (unsigned int)g_lastTitleId,
+					(unsigned long)s_calls);
+				s_lx = pInputData->sThumbLX; s_ly = pInputData->sThumbLY;
+				s_rx = pInputData->sThumbRX; s_ry = pInputData->sThumbRY; s_btn = pInputData->wButtons;
+				s_lastLine = now; s_calls = 0;
+			}
+		}
+
+		if (!g_mergeInternalRead) HudNotePad(pInputData);
 		return STATUS_SUCCESS;
 	}
-	return XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(dwDeviceContext, pdwPacketNumber, pInputData, unk);
+	// Real controller (or any device that is not ours).
+	NTSTATUS realStatus = XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(dwDeviceContext, pdwPacketNumber, pInputData, unk);
+#if EN_CAMERA_LEARN
+	// Camera search (v1.2.1 v3, 2026-10-07): the stick is ALSO injected into
+	// the real controller. If the keyboard/mouse ended up as player 2 (pad
+	// plugged first), the game listens to the pad only - injecting into our
+	// virtual controller alone then turned nothing, and every search failed.
+	// The packet number is bumped so games that only react to a new packet
+	// see the change; the bump only ever grows, so packet numbers stay
+	// increasing for that controller.
+	if (realStatus == 0 && pInputData) {        // cache for the Win+Shift+X switch
+		g_realPad = *pInputData;
+		MemoryBarrier();
+		g_realPadTick = GetTickCount();
+	}
+	// The real controller is player 1 and the keyboard / mouse got another slot -
+	// read that slot here (same code as when the game reads it). Merged: added to
+	// the pad. Separate: it replaces the pad (keyboard / mouse = player 1) and its
+	// own slot plays the pad (g_displacedPad). Only ONE pad: the lowest device
+	// context seen in the last second.
+	{
+		static DWORD s_targetCtx = 0, s_targetTick = 0, s_mergeBump = 0;
+		static XINPUT_GAMEPAD s_lastVirt;
+		const DWORD now = GetTickCount();
+		if (s_targetCtx == 0 || dwDeviceContext <= s_targetCtx || (now - s_targetTick) > 1000) {
+			s_targetCtx = dwDeviceContext;
+		}
+		if (dwDeviceContext == s_targetCtx) s_targetTick = now;
+
+		if (realStatus == 0 && pInputData && dwDeviceContext == s_targetCtx &&
+			!g_remapPaused && !g_mergeInternalRead && !g_pollRealRead) {
+			Controller* v = nullptr;
+			for (int i = 0; i < (int)(sizeof(connectedControllers) / sizeof(Controller)); i++) {
+				Controller& k = connectedControllers[i];
+				if (k.controllerDriver && (k.isMouse || k.isKeyboard) &&
+					k.deviceContext >= 0x10000005 && k.userIndex != 0) { v = &k; break; }
+			}
+			if (v) {
+				XINPUT_GAMEPAD virt;
+				memset(&virt, 0, sizeof(virt));
+				DWORD pkt = 0;
+				g_mergeInternalRead = true;
+				const NTSTATUS st = XInputdReadStateHook(v->deviceContext, &pkt, &virt, nullptr);
+				g_mergeInternalRead = false;
+				if (st == STATUS_SUCCESS) {
+					if (memcmp(&virt, &s_lastVirt, sizeof(virt)) != 0) { s_lastVirt = virt; s_mergeBump++; }
+					if (g_playersSeparate) {
+						g_displacedPad = *pInputData;
+						MemoryBarrier();
+						*pInputData = virt;
+					} else {
+						MergeGamepad(pInputData, &virt);
+					}
+					g_mergeDeliveredTick = now;
+				}
+			}
+		}
+		// A new packet number when the keyboard / mouse part changes, so
+		// games that only react to new packets see it (only ever grows).
+		if (realStatus == 0 && pdwPacketNumber && s_mergeBump)
+			*pdwPacketNumber += s_mergeBump;
+	}
+	{
+		static volatile uint32_t s_packetBump = 0;
+		if (realStatus == 0 && pInputData && g_learnInject) {
+			pInputData->sThumbRX = (int16_t)g_learnRX;
+			pInputData->sThumbRY = (int16_t)g_learnRY;
+			s_packetBump++;
+			g_learnHookTick = GetTickCount();
+		}
+		if (realStatus == 0 && pdwPacketNumber && s_packetBump)
+			*pdwPacketNumber += s_packetBump;
+	}
+#endif
+	// Merged players, keyboard / mouse = player 1: the pad's input already
+	// reaches player 1 (see g_padIntoKbmTick), so the pad's own slot rests.
+	// g_realPad was cached above, before this. Not for our own reads.
+	if (realStatus == 0 && pInputData && !g_playersSeparate && !g_remapPaused &&
+		!g_pollRealRead && !g_mergeInternalRead &&
+		g_padIntoKbmTick != 0 && (GetTickCount() - g_padIntoKbmTick) < 500) {
+		memset(pInputData, 0, sizeof(XINPUT_GAMEPAD));
+	}
+	if (realStatus == 0 && pInputData && !g_pollRealRead && !g_mergeInternalRead) HudNotePad(pInputData);
+	return realStatus;
 }
 
 
@@ -6431,7 +10127,10 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		SafeDbgPrint("X360Remap: HELLO from xbox 360 HID controller driver version 0.6 beta\n");
 		// Libelle mis a jour (AUDIT M5) : le journal s'annoncait encore sous le
 		// nom et la version du projet d'origine.
-		FileLog("--- X360Remap plugin v1.2 (fork of hiddriver360) starting, dashboard build %d ---", XboxKrnlVersion->Build);
+		FileLog("--- X360Remap plugin v%hs (fork of hiddriver360) starting, dashboard build %d ---", X360REMAP_VERSION, XboxKrnlVersion->Build);
+		// Controllers known in advance: last lookup of FindMapping.
+		g_extraMappingLookup = FindKnownControllerMapping;
+		FileLog("Known controllers list: %u controllers (SDL GameControllerDB)", kKnownControllerCount);
 		// Log where the in-memory log buffer actually lives, so it can be read
 		// over the network via XBDM (e.g. xecli: "rgh mem strings --addr <this>
 		// --size 8192") EVEN WHEN THE CONSOLE IS FROZEN - XBDM runs in its own
@@ -6466,86 +10165,15 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		// absent (Slim 4 Go, console lancee depuis USB...). Validation par une
 		// vraie creation de dossier : un prefixe peut exister sans etre
 		// inscriptible.
-		{
-			// ORDRE ET REGLE ALIGNES SUR LA STUDIO (AUDIT_2026-09.md, I3).
-			//
-			// 1. Disque dur d'abord, EXACTEMENT comme avant : sur une console
-			//    avec disque dur, rien ne change a l'octet pres.
-			// 2. Sans disque dur, l'ancien code prenait le premier support
-			//    inscriptible, dans un ordre DIFFERENT de celui de la Studio
-			//    (elle essayait la cle USB avant la memoire interne). Sur une
-			//    Slim 4 Go avec une cle branchee - la configuration du testeur
-			//    BadUpdate - la Studio ecrivait sur la cle et le plugin lisait
-			//    la memoire interne. Regle commune desormais, dans le meme ordre
-			//    (memoire interne, puis USB) des deux cotes :
-			//      a. le support qui contient DEJA X360Remap.json ;
-			//      b. sinon celui qui contient deja le dossier X360RemapStudio ;
-			//      c. sinon le premier inscriptible.
-			static const char* kHddCandidates[] = {
-				"HDD:",        // disque dur (comportement historique)
-				"Hdd1:",       // meme disque, autre nom expose par la console
-			};
-			static const char* kFallbackCandidates[] = {
-				"OnBoardMU:",  // stockage interne 4 Go des modeles Slim
-				"INTUSB:",     // stockage interne vu comme USB
-				"Usb0:",       // premiere cle USB
-			};
-			const int kFallbackCount = (int)(sizeof(kFallbackCandidates) / sizeof(kFallbackCandidates[0]));
-			bool resolved = false;
-
-			for (int i = 0; i < (int)(sizeof(kHddCandidates) / sizeof(kHddCandidates[0])) && !resolved; i++) {
-				char dir[64];
-				_snprintf(dir, sizeof(dir) - 1, "%s\\X360RemapStudio", kHddCandidates[i]);
-				dir[sizeof(dir) - 1] = '\0';
-				if (CreateDirectoryA(dir, nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) {
-					_snprintf(g_studioDrive, sizeof(g_studioDrive) - 1, "%s", kHddCandidates[i]);
-					g_studioDrive[sizeof(g_studioDrive) - 1] = '\0';
-					resolved = true;
-				}
-			}
-
-			// a. et b. : simple lecture des attributs, aucune creation.
-			for (int pass = 0; pass < 2 && !resolved; pass++) {
-				for (int i = 0; i < kFallbackCount && !resolved; i++) {
-					char probe[96];
-					if (pass == 0)
-						_snprintf(probe, sizeof(probe) - 1, "%s\\X360RemapStudio\\X360Remap.json", kFallbackCandidates[i]);
-					else
-						_snprintf(probe, sizeof(probe) - 1, "%s\\X360RemapStudio", kFallbackCandidates[i]);
-					probe[sizeof(probe) - 1] = '\0';
-					if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
-						_snprintf(g_studioDrive, sizeof(g_studioDrive) - 1, "%s", kFallbackCandidates[i]);
-						g_studioDrive[sizeof(g_studioDrive) - 1] = '\0';
-						resolved = true;
-					}
-				}
-			}
-
-			// c. : premier support inscriptible (validation par une vraie
-			// creation de dossier, comme avant).
-			for (int i = 0; i < kFallbackCount && !resolved; i++) {
-				char dir[64];
-				_snprintf(dir, sizeof(dir) - 1, "%s\\X360RemapStudio", kFallbackCandidates[i]);
-				dir[sizeof(dir) - 1] = '\0';
-				if (CreateDirectoryA(dir, nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) {
-					_snprintf(g_studioDrive, sizeof(g_studioDrive) - 1, "%s", kFallbackCandidates[i]);
-					g_studioDrive[sizeof(g_studioDrive) - 1] = '\0';
-					resolved = true;
-				}
-			}
-
-			if (resolved) {
-				// Trace volontairement ecrite meme en cas de succes : c'est la
-				// seule facon de savoir, depuis le journal d'un testeur, quel
-				// support a reellement ete retenu chez lui.
-				FileLog("Working folder: %s\\X360RemapStudio", g_studioDrive);
-			}
-			if (!resolved) {
-				// Aucun support inscriptible : le plugin va continuer (il ne
-				// doit pas empecher la console de demarrer) mais ni la config
-				// ni le journal ne seront disponibles.
-				FileLog("No writable storage found (tried HDD:, Hdd1:, OnBoardMU:, INTUSB:, Usb0:)");
-			}
+		// Storage resolution moved to ResolveStudioDrive() (2026-10-29). Fallback
+		// "c." (create a NEW folder on internal memory / USB) is no longer done
+		// here: the hard drive is often not mounted yet at this point, and a
+		// USB stick plugged at boot would win for the whole session. The
+		// polling thread retries the hard drive for 60 s first.
+		if (ResolveStudioDrive(STORAGE_PASS_BOOT)) {
+			FileLog("Working folder: %s\\X360RemapStudio", g_studioDrive);
+		} else {
+			FileLog("Storage not ready at boot (tried HDD:, Hdd1:, existing folders on OnBoardMU:, INTUSB:, Usb0:, USB sticks Mass0-2) - retrying for 60 s, then X360R: as a last resort");
 		}
 
 		// --- Traçage pas-a-pas de l'initialisation (2026-08-22) ---
@@ -6622,6 +10250,11 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		// Apres initFunctionPointers() (qui a deja decide si le systeme de
 		// notification est utilisable) : ce reglage explicite prime toujours.
 		LoadNotificationSetting();
+		LoadFreezeTestSettings();   // 2026-10-05: freeze A/B switches, see g_deferReportFree
+
+#if EN_CAMERA_LEARN
+		LoadLearnedCameras();   // v1.2.1: camera_addresses.txt (cameras learned with F12)
+#endif
 
 		// Meme principe : lu une seule fois au demarrage, pas a chaque tick du
 		// thread de polling (voir lang.h/lang.cpp). Decide dans quelle langue
@@ -6655,6 +10288,8 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 		XamInputSetStateDetour.Install();
 		XamInputGetCapabilitiesDetour.Install();
 		XInputdReadStateDetour.Install();
+		InstallVdSwapHook();
+		InstallBlackBox();
 		SafeDbgPrint("X360Remap: Hooks installed\n");
 		FileLog("Hooks installed");
 		// A partir d'ici, un peripherique branche peut declencher nos hooks :

@@ -34,6 +34,9 @@ struct KnownDeviceEntry {
     uint16_t vid;
     uint16_t pid;
     bool isMouse; // false = clavier
+    // USB pad (type "C", 2026-11-05): the Studio's pad button lists them by name.
+    // isMouse is false for a pad: readers must check isPad first.
+    bool isPad;
     // Nom lisible declare par le peripherique lui-meme (descripteur de chaine
     // USB, index iProduct), ajoute le 2026-08-03 sur remarque de l'utilisateur :
     // "pourquoi lui afficher les peripheriques par hex au lieu de nom". On
@@ -69,4 +72,4 @@ bool AddKnownDevice(std::vector<KnownDeviceEntry>* devices, uint16_t vid, uint16
 // nom, cas d'un fichier ecrit par une version anterieure du plugin. L'appelant
 // doit alors reecrire le fichier.
 bool AddKnownDevice(std::vector<KnownDeviceEntry>* devices, uint16_t vid, uint16_t pid,
-                    bool isMouse, const char* name);
+                    bool isMouse, const char* name, bool isPad = false);

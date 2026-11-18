@@ -7,6 +7,7 @@
 UiMappingModel::UiMappingModel()
     : mode(0), langIndex(0), keyboardIndex(0), mouseIndex(0),
       keyboards(0), keyboardCount(0), mice(0), mouseCount(0),
+      pads(0), padCount(0), requestOpenPad(-1),
       detectedCount(0), pluginAlive(false),
       texKeyboardSide(0), texKbW(0), texKbH(0),
       texMouseSide(0), texMsW(0), texMsH(0),
@@ -1263,16 +1264,16 @@ void DrawUiTopBar(float screenW, float screenH, int& activeTab) {
     PopX360Font(g_fontSmall);
 
     // --- Onglets ---
-    const StrId tabIds[4] = {
-        STR_APP_TAB_MAPPING, STR_APP_TAB_PROFILES, STR_APP_TAB_HOWTO, STR_APP_TAB_SUPPORT
+    const StrId tabIds[5] = {
+        STR_APP_TAB_MAPPING, STR_APP_TAB_PROFILES, STR_OV_TAB, STR_APP_TAB_HOWTO, STR_APP_TAB_SUPPORT
     };
-    const IconKind tabIcons[4] = { ICON_KEYBOARD, ICON_LIST, ICON_HELP, ICON_HEART };
+    const IconKind tabIcons[5] = { ICON_KEYBOARD, ICON_LIST, ICON_KEYBOARD, ICON_HELP, ICON_HEART };
 
     PushX360Font(g_fontSmall);
     const float tabsY = logoY + logoH * 0.5f;              // centre optique du logo
     const float lineH = ImGui::GetTextLineHeight();
     float tx = marginX + logoW + 48.0f;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         const bool on = (activeTab == i);
         // Capitales, comme dans la maquette : c'est ce qui distingue le menu
         // du texte courant a distance d'un canape.

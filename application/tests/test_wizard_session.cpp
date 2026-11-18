@@ -653,11 +653,96 @@ static void TestListKnownDevices() {
         CHECK(devices[1].isMouse);
     }
 
+    // Type C = USB pad: isPad set, never a mouse.
+    { std::ofstream o(path, std::ios::binary); o << "045E:028E:C:Pad One\n0461:3F41:K\n"; }
+    devices = ListKnownDevices(path);
+    CHECK(devices.size() == 2);
+    if (devices.size() == 2) {
+        CHECK(devices[0].isPad && !devices[0].isMouse && std::strcmp(devices[0].name, "Pad One") == 0);
+        CHECK(!devices[1].isPad);
+    }
+
     std::printf("  liste vide si fichier absent, sinon relue correctement (type exact, pas une heuristique)\n");
     std::remove(path);
 }
 
+// USB controller page: edit only an entry that already has axes, keep the axes.
+static void TestPadConfig() {
+    std::printf("TestPadConfig\n");
+    const char* path = "/tmp/test_pad_config.json";
+    WriteFile(path, R"JSON([
+ {"vid":1234,"pid":1,"axes":[{"usage":48,"field":"x"},{"usage":49,"field":"y"}],
+  "buttons":[{"idx":0,"field":"a_button"},{"idx":3,"field":"y_button"}]},
+ {"vid":1234,"pid":2,"buttons":[{"idx":0,"field":"a_button"}]}
+])JSON");
+    PadConfig pc;
+    ClearDynamicMappings();
+    CHECK(ReadPadConfig(1234, 1, pc, path));
+    CHECK(pc.hasEntry && pc.hasAxes && !pc.invertRY);
+    CHECK(pc.btnIdx[0] == 0 && pc.btnIdx[3] == 3 && pc.btnIdx[1] == -1);
+
+    int idx[PAD_CELLS];
+    for (int i = 0; i < PAD_CELLS; i++) idx[i] = -1;
+    idx[0] = 5; idx[1] = 0;           // A <- B6, B <- B1
+    PadMacro mac[1];                              // B4 = A + B held; B4 was Y: must leave "buttons"
+    mac[0].btn = 3; mac[0].stepCount = 1; mac[0].steps[0].mask = 3; mac[0].steps[0].ms = 0;
+    idx[3] = 3;
+    CHECK(ApplyPadButtons(1234, 1, idx, mac, 1, path));
+    CHECK(ApplyPadStick(1234, 1, true, 900, path));
+    ClearDynamicMappings();
+    CHECK(ReadPadConfig(1234, 1, pc, path));
+    CHECK(pc.hasAxes && pc.invertRY && pc.deadzone == 900);
+    CHECK(pc.btnIdx[0] == 5 && pc.btnIdx[1] == 0 && pc.btnIdx[3] == -1);
+    CHECK(pc.macroCount == 1 && pc.macros[0].btn == 3 && pc.macros[0].stepCount == 1);
+    CHECK(pc.macros[0].steps[0].mask == 3 && pc.macros[0].steps[0].ms == 0);
+
+    CHECK(!ApplyPadButtons(1234, 2, idx, mac, 1, path));   // entry without axes: refused
+    CHECK(!ApplyPadButtons(1234, 9, idx, mac, 1, path));   // unknown pad: refused
+    ClearDynamicMappings();
+    CHECK(ReadPadConfig(1234, 2, pc, path) && !pc.hasAxes);
+    ClearDynamicMappings();
+    std::remove(path);
+
+    // Sequences: save then read back (order, masks, durations, pause, held step), and
+    // the old "fields" form is read as one held step.
+    WriteFile(path, R"JSON([
+ {"vid":1234,"pid":1,"axes":[{"usage":48,"field":"x"}],"buttons":[{"idx":0,"field":"a_button"}],
+  "macros":[{"idx":4,"fields":["a_button","b_button"]}]}
+])JSON");
+    ClearDynamicMappings();
+    CHECK(ReadPadConfig(1234, 1, pc, path));
+    CHECK(pc.macroCount == 1 && pc.macros[0].btn == 4 && pc.macros[0].stepCount == 1 && pc.macros[0].steps[0].mask == 3);
+    PadMacro seq[2];
+    seq[0].btn = 6; seq[0].stepCount = 4;
+    seq[0].steps[0].mask = 1u << 14; seq[0].steps[0].ms = 50;                       // D-down 50 ms
+    seq[0].steps[1].mask = (1u << 14) | (1u << 16); seq[0].steps[1].ms = 33;        // D-down + D-right
+    seq[0].steps[2].mask = 0;       seq[0].steps[2].ms = 100;                       // pause
+    seq[0].steps[3].mask = 1u << 2; seq[0].steps[3].ms = 0;                         // X while held
+    seq[1].btn = 7; seq[1].stepCount = 1; seq[1].steps[0].mask = 1u << 3; seq[1].steps[0].ms = 9000;   // clamped to 5000
+    ClearDynamicMappings();
+    CHECK(ApplyPadButtons(1234, 1, idx, seq, 2, path));
+    ClearDynamicMappings();
+    CHECK(ReadPadConfig(1234, 1, pc, path));
+    CHECK(pc.macroCount == 2 && pc.macros[0].btn == 6 && pc.macros[0].stepCount == 4);
+    CHECK(pc.macros[0].steps[0].mask == (1u << 14) && pc.macros[0].steps[0].ms == 50);
+    CHECK(pc.macros[0].steps[1].mask == ((1u << 14) | (1u << 16)) && pc.macros[0].steps[1].ms == 33);
+    CHECK(pc.macros[0].steps[2].mask == 0 && pc.macros[0].steps[2].ms == 100);
+    CHECK(pc.macros[0].steps[3].mask == (1u << 2) && pc.macros[0].steps[3].ms == 0);
+    CHECK(pc.macros[1].stepCount == 1 && pc.macros[1].steps[0].ms == 5000);
+    CHECK(pc.btnIdx[0] == 5 && pc.btnIdx[1] == 0);       // plain buttons untouched
+    std::remove(path);
+
+    // 'c' entries (USB pads) and the optional padBtn mask of input_state.json
+    const char* sp = "/tmp/test_pad_state.json";
+    WriteFile(sp, R"JSON({ "keyCode": -1, "tick": 7, "devs": "k:046d:c33a;c:0079:0006", "padBtn": "0005" })JSON");
+    InputStateSnapshot s = ReadInputState(sp);
+    CHECK(s.valid && s.devCount == 2 && s.devType[1] == 'c' && s.devVid[1] == 0x79 && s.devPid[1] == 6);
+    CHECK(s.hasPadBtn && s.padBtn == 5);
+    std::remove(sp);
+}
+
 int main() {
+    TestPadConfig();
     TestReadInputState();
     TestWizardSessionEndToEnd();
     TestWizardPreservesOtherDeviceEntries();

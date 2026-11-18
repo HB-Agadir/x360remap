@@ -16,7 +16,9 @@
 #include "i18n.h"
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <cfloat>
+#include <cmath>
 #include <vector>
 
 namespace {
@@ -180,6 +182,74 @@ bool Button(const char* id, const GlRect& r, const GlRect& txt, int texN, int te
 }
 
 
+// Pad icon in the blue of the keyboard / mouse icons (no image asset exists for it).
+void DrawPadGlyph(float gx, float gy, float gw, float gh) {
+    const ImU32 c = Rgb(0x6FC3FF);
+    const float x = gx, y = gy + 3.0f, w = gw, hh = gh - 6.0f;
+    s_dl->AddRect(P(x, y), P(x + w, y + hh), c, 9.0f * s_k, ImDrawCornerFlags_All, 2.0f);
+    s_dl->AddLine(P(x + 10.0f, y + hh * 0.5f), P(x + 18.0f, y + hh * 0.5f), c, 2.0f);
+    s_dl->AddLine(P(x + 14.0f, y + hh * 0.5f - 4.0f), P(x + 14.0f, y + hh * 0.5f + 4.0f), c, 2.0f);
+    s_dl->AddCircleFilled(P(x + w - 11.0f, y + hh * 0.5f - 3.0f), 2.0f * s_k, c);
+    s_dl->AddCircleFilled(P(x + w - 7.0f, y + hh * 0.5f + 3.0f), 2.0f * s_k, c);
+}
+
+// USB controller chip of the device bar (2026-11-05): the keyboard / mouse chip
+// look (chip, icon, dot, arrow). There is no pad image asset, so the icon is drawn.
+bool PadChip(bool selected, bool alive) {
+    Hit h = HitAt("##gl_devpad", GL_PucePad);
+    ImgAt((h.hot || selected || s_menu == 2) ? GA_DEV_CHIP_ON : GA_DEV_CHIP, GL_PucePad);
+    if (selected) s_dl->AddRect(P(GL_PucePad.x - 2.0f, GL_PucePad.y - 2.0f), P(GL_PucePad.x + GL_PucePad.w + 2.0f, GL_PucePad.y + GL_PucePad.h + 2.0f), Rgb(kGold), 6.0f * s_k, ImDrawCornerFlags_All, 2.0f);
+    DrawPadGlyph(GL_IcoPad.x, GL_IcoPad.y, GL_IcoPad.w, GL_IcoPad.h);
+    ImgAt(alive ? GA_DOT_ON : GA_DOT_RED, GL_DotPad);
+    ImgAt(GA_CHEVRON, GL_ChevronPad);
+    return h.pressed;
+}
+
+// Drop-down list under a chip (name + VID:PID, then "Refresh"). Returns the picked
+// index or -1; sets refresh when the last row is clicked. Closes on a pick or an outside click.
+int DeviceMenu(int d, const UiDeviceEntry* list, int count, int sel, const GlRect& c0, bool& refresh) {
+    ImGuiIO& io = ImGui::GetIO();
+    char buf[64];
+    if (!list) count = 0;
+    const float rowH = 40.0f, mw = 380.0f;
+    const int rows = (count > 0 ? count : 1) + 1;   // + "Refresh" row
+    const float mx = c0.x + c0.w * 0.5f - mw * 0.5f, my = c0.y + c0.h + 8.0f;
+    const float mh = rows * rowH + 12.0f;
+    s_dl->AddRectFilled(P(mx - 4.0f, my + 2.0f), P(mx + mw + 4.0f, my + mh + 10.0f), IM_COL32(0, 0, 0, 90), 8.0f * s_k);
+    s_dl->AddRectFilled(P(mx, my), P(mx + mw, my + mh), Rgb(0x0F1824, 248), 5.0f * s_k);
+    s_dl->AddRect(P(mx, my), P(mx + mw, my + mh), Rgb(0x6CA2DE, 200), 5.0f * s_k, ImDrawCornerFlags_All, 1.0f);
+    s_dl->AddLine(P(mx + 10.0f, my + 1.0f), P(mx + mw - 10.0f, my + 1.0f), Rgb(0xBFE2FF, 160), 1.0f);
+    int picked = -1;
+    bool close = false;
+    if (count == 0) Text(g_fontGBody, 24.0f, mx + 16.0f, my + 6.0f + rowH * 0.5f, Rgb(kTxt3), Tr(STR_GLOSSY_NONE));
+    for (int i = 0; i < count; i++) {
+        const float ry = my + 6.0f + rowH * i;
+        sprintf(buf, "##gl_menu%d_%d", d, i);
+        Hit h = HitRect(buf, mx + 4.0f, ry, mw - 8.0f, rowH);
+        const bool on = (i == sel);
+        if (h.hot) s_dl->AddRectFilled(P(mx + 4.0f, ry + 2.0f), P(mx + mw - 4.0f, ry + rowH - 2.0f), Rgb(kGold, 38), 3.0f * s_k);
+        Img(list[i].active ? GA_DOT_ON : GA_DOT_RED, mx + 14.0f, ry + rowH * 0.5f - 5.0f);
+        const float idW = TextW(g_fontGBody, 22.0f, list[i].id);
+        Text(on ? g_fontGBodyM : g_fontGBody, 24.0f, mx + 34.0f, ry + rowH * 0.5f,
+             Rgb(on || h.hot ? kGold : kTxt), list[i].name, AL_L, mw - 34.0f - idW - 30.0f);
+        Text(g_fontGBody, 22.0f, mx + mw - 14.0f, ry + rowH * 0.5f, Rgb(kTxt3), list[i].id, AL_R);
+        if (h.pressed) { picked = i; close = true; }
+    }
+    {
+        const float ry = my + 6.0f + rowH * (rows - 1);
+        s_dl->AddLine(P(mx + 10.0f, ry), P(mx + mw - 10.0f, ry), Rgb(0x2C3B4F), 1.0f);
+        Hit h = HitRect("##gl_menu_refresh", mx + 4.0f, ry, mw - 8.0f, rowH);
+        if (h.hot) s_dl->AddRectFilled(P(mx + 4.0f, ry + 2.0f), P(mx + mw - 4.0f, ry + rowH - 2.0f), Rgb(kGold, 38), 3.0f * s_k);
+        Text(g_fontGBody, 24.0f, mx + 34.0f, ry + rowH * 0.5f, Rgb(h.hot ? kGold : kTxt2), Tr(STR_GLOSSY_REFRESH));
+        Text(g_fontGBodyM, 24.0f, mx + 16.0f, ry + rowH * 0.5f, Rgb(h.hot ? kGold : kTxt2), "â€¦", AL_M);
+        if (h.pressed) { refresh = true; close = true; }
+    }
+    const ImVec2 mp = io.MousePos;
+    const bool inside = mp.x >= mx * s_k && mp.x <= (mx + mw) * s_k && mp.y >= c0.y * s_k && mp.y <= (my + mh) * s_k;
+    if (close || (ImGui::IsMouseClicked(0) && !inside)) s_menu = -1;
+    return picked;
+}
+
 // Badge de chaque case de la grille, dans l'ordre de l'assistant.
 const int kGridBadge[21] = {
     // Icones Kenney "Input Prompts" (CC0) - 2026-09-25
@@ -202,6 +272,10 @@ bool UiGlossyReady() {
     return true;
 }
 
+// Windows Studio: it draws its own tab bar (more pages, icons): only background and logo here.
+static bool s_externalTabs = false;
+void UiGlossySetExternalTabs(bool on) { s_externalTabs = on; }
+
 // En-tete commun a toutes les pages a onglets : fond, logo, onglets, LB/RB.
 static void HeaderAndTabs(int& activeTab, bool busy) {
     char buf[64];
@@ -217,11 +291,18 @@ static void HeaderAndTabs(int& activeTab, bool busy) {
     }
     // (Badges LB/RB retires le 2026-09-25, decision HB : pas de navigation
     //  manette affichee tant que la v1.3 ne gere pas vraiment les manettes.)
+    if (s_externalTabs) return;
     ImgAt(GA_TABBAR, GL_Onglets);
     {
-        const StrId tabIds[4] = { STR_GLOSSY_TAB_KBMOUSE, STR_GLOSSY_TAB_GAMES, STR_GLOSSY_TAB_HOWTO, STR_GLOSSY_TAB_SUPPORT };
+        const StrId tabIds[5] = { STR_GLOSSY_TAB_KBMOUSE, STR_GLOSSY_TAB_GAMES, STR_OV_TAB, STR_GLOSSY_TAB_HOWTO, STR_GLOSSY_TAB_SUPPORT };
         const float tw = GL_OngletActif.w;
-        for (int i = 0; i < 4; i++) {
+        // The tab bar texture holds four tabs: the fifth cell is drawn next to it.
+        {
+            const float x5 = GL_Onglets.x + GL_Onglets.w, y5 = GL_Onglets.y, h5 = GL_Onglets.h;
+            s_dl->AddRectFilledMultiColor(P(x5, y5), P(x5 + tw, y5 + h5), Rgb(0x14243C), Rgb(0x14243C), Rgb(0x0B1626), Rgb(0x0B1626));
+            s_dl->AddRect(P(x5, y5), P(x5 + tw, y5 + h5), Rgb(0x2C4468), 0.0f, ImDrawCornerFlags_All, 1.0f);
+        }
+        for (int i = 0; i < 5; i++) {
             const float x = GL_OngletActif.x + tw * i;
             sprintf(buf, "##gl_tab%d", i);
             Hit h = HitRect(buf, x, GL_OngletActif.y, tw, GL_OngletActif.h);
@@ -255,6 +336,7 @@ void DrawUiGlossyMapping(UiMappingModel& m, int& activeTab, float screenW, float
     // =========================================================================
     // Fond + en-tete
     // =========================================================================
+    if (s_menu == 2 && m.padCount == 0) s_menu = -1;   // the last pad was unplugged
     s_blockHits = (s_menu >= 0);
     HeaderAndTabs(activeTab, busy);
 
@@ -305,6 +387,12 @@ void DrawUiGlossyMapping(UiMappingModel& m, int& activeTab, float screenW, float
             ImgAt(alive ? GA_DOT_ON : GA_DOT_RED, *dot[d]);
             ImgAt(GA_CHEVRON, *chev[d]);
             if (h.pressed) s_menu = (s_menu == d) ? -1 : d;
+        }
+        // USB controllers: one chip of the same kind, shown when a pad is plugged.
+        if (m.padCount > 0) {
+            bool any = false;
+            for (int i = 0; i < m.padCount; i++) any = any || m.pads[i].active;
+            if (PadChip(false, any)) s_menu = (s_menu == 2) ? -1 : 2;
         }
 
         // Langues : drapeaux (EN FR ES PT), index du modele FR=0 EN=1 PT=2 ES=3.
@@ -644,56 +732,19 @@ void DrawUiGlossyMapping(UiMappingModel& m, int& activeTab, float screenW, float
     if (s_menu >= 0) {
         s_blockHits = false;
         const int d = s_menu;
-        const UiDeviceEntry* list = d == 0 ? m.keyboards : m.mice;
-        const int count = (list && (d == 0 ? m.keyboardCount : m.mouseCount) > 0) ? (d == 0 ? m.keyboardCount : m.mouseCount) : 0;
-        int& sel = d == 0 ? m.keyboardIndex : m.mouseIndex;
-        const GlRect& c0 = d == 0 ? GL_PuceClavier : GL_PuceSouris;
-        const float rowH = 40.0f, mw = 380.0f;
-        const int rows = (count > 0 ? count : 1) + 1;   // + ligne "Actualiser"
-        const float mx = c0.x + c0.w * 0.5f - mw * 0.5f, my = c0.y + c0.h + 8.0f;
-        const float mh = rows * rowH + 12.0f;
-
-        // ombre, fond, bordure
-        s_dl->AddRectFilled(P(mx - 4.0f, my + 2.0f), P(mx + mw + 4.0f, my + mh + 10.0f), IM_COL32(0, 0, 0, 90), 8.0f * s_k);
-        s_dl->AddRectFilled(P(mx, my), P(mx + mw, my + mh), Rgb(0x0F1824, 248), 5.0f * s_k);
-        s_dl->AddRect(P(mx, my), P(mx + mw, my + mh), Rgb(0x6CA2DE, 200), 5.0f * s_k, ImDrawCornerFlags_All, 1.0f);
-        s_dl->AddLine(P(mx + 10.0f, my + 1.0f), P(mx + mw - 10.0f, my + 1.0f), Rgb(0xBFE2FF, 160), 1.0f);
-
-        bool picked = false;
-        if (count == 0) {
-            Text(g_fontGBody, 24.0f, mx + 16.0f, my + 6.0f + rowH * 0.5f, Rgb(kTxt3), Tr(STR_GLOSSY_NONE));
+        bool refresh = false;
+        int picked;
+        if (d == 2) {
+            picked = DeviceMenu(2, m.pads, m.padCount, -1, GL_PucePad, refresh);
+            if (picked >= 0 && !busy) m.requestOpenPad = picked;
+        } else {
+            const UiDeviceEntry* list = d == 0 ? m.keyboards : m.mice;
+            const int count = d == 0 ? m.keyboardCount : m.mouseCount;
+            int& sel = d == 0 ? m.keyboardIndex : m.mouseIndex;
+            picked = DeviceMenu(d, list, count, sel, d == 0 ? GL_PuceClavier : GL_PuceSouris, refresh);
+            if (picked >= 0) sel = picked;
         }
-        for (int i = 0; i < count; i++) {
-            const float ry = my + 6.0f + rowH * i;
-            sprintf(buf, "##gl_menu%d_%d", d, i);
-            Hit h = HitRect(buf, mx + 4.0f, ry, mw - 8.0f, rowH);
-            const bool on = (i == sel);
-            if (h.hot) s_dl->AddRectFilled(P(mx + 4.0f, ry + 2.0f), P(mx + mw - 4.0f, ry + rowH - 2.0f), Rgb(kGold, 38), 3.0f * s_k);
-            Img(list[i].active ? GA_DOT_ON : GA_DOT_RED, mx + 14.0f, ry + rowH * 0.5f - 5.0f);
-            const float idW = TextW(g_fontGBody, 22.0f, list[i].id);
-            Text(on ? g_fontGBodyM : g_fontGBody, 24.0f, mx + 34.0f, ry + rowH * 0.5f,
-                 Rgb(on || h.hot ? kGold : kTxt), list[i].name, AL_L, mw - 34.0f - idW - 30.0f);
-            Text(g_fontGBody, 22.0f, mx + mw - 14.0f, ry + rowH * 0.5f, Rgb(kTxt3), list[i].id, AL_R);
-            if (h.pressed) { sel = i; picked = true; }
-        }
-
-        {
-            // Derniere ligne : actualiser la liste (les appareils branches
-            // apparaissent aussi tout seuls, voir main.cpp).
-            const float ry = my + 6.0f + rowH * (rows - 1);
-            s_dl->AddLine(P(mx + 10.0f, ry), P(mx + mw - 10.0f, ry), Rgb(0x2C3B4F), 1.0f);
-            Hit h = HitRect("##gl_menu_refresh", mx + 4.0f, ry, mw - 8.0f, rowH);
-            if (h.hot) s_dl->AddRectFilled(P(mx + 4.0f, ry + 2.0f), P(mx + mw - 4.0f, ry + rowH - 2.0f), Rgb(kGold, 38), 3.0f * s_k);
-            Text(g_fontGBody, 24.0f, mx + 34.0f, ry + rowH * 0.5f, Rgb(h.hot ? kGold : kTxt2), Tr(STR_GLOSSY_REFRESH));
-            Text(g_fontGBodyM, 24.0f, mx + 16.0f, ry + rowH * 0.5f, Rgb(h.hot ? kGold : kTxt2), "\xE2\x80\xA6", AL_M);
-            if (h.pressed) { m.requestRefreshDevices = true; picked = true; }
-        }
-
-        // Fermeture : choix fait, B a la manette, ou clic en dehors du menu.
-        const ImVec2 mp = io.MousePos;
-        const bool inside = mp.x >= mx * s_k && mp.x <= (mx + mw) * s_k && mp.y >= (c0.y) * s_k && mp.y <= (my + mh) * s_k;
-        if (picked || (ImGui::IsMouseClicked(0) && !inside))
-            s_menu = -1;
+        if (refresh) m.requestRefreshDevices = true;
     }
     s_blockHits = false;
 }
@@ -1005,7 +1056,7 @@ void DrawUiGlossyGames(GlossyGamesModel& gm, int& activeTab, float screenW, floa
     s_blockHits = false;
     ImGuiIO& io = ImGui::GetIO();
     char buf[256];
-    gm.reqSave = gm.reqDelete = gm.reqSelect = gm.reqEditName = gm.reqSaveExplicit = gm.reqDeleteAll = false;
+    gm.reqSave = gm.reqDelete = gm.reqSelect = gm.reqEditName = gm.reqSaveExplicit = gm.reqDeleteAll = gm.reqDeleteCam = false;
 
     HeaderAndTabs(activeTab, false);
 
@@ -1180,6 +1231,23 @@ void DrawUiGlossyGames(GlossyGamesModel& gm, int& activeTab, float screenW, floa
         if (h.hot) ImGui::SetTooltip("%s", Tr(STR_GAMES_STICKS_TIP));
         if (h.pressed) { *gm.stickLayout = (v + 1) % 4; gm.reqSave = true; }
         if (h.rclick)  { *gm.stickLayout = (v + 3) % 4; gm.reqSave = true; }
+        // Learned camera: status, two clicks delete it.
+        if (gm.camState) {
+            static double s_camConfirm = -1.0;
+            const double now = ImGui::GetTime();
+            const bool confirming = s_camConfirm > now;
+            const char* lbl = confirming ? Tr(STR_GLOSSY_CONFIRM) : Tr(gm.camState == 2 ? STR_GAMES_CAM_BOTH : STR_GAMES_CAM_H);
+            const float cwid = TextW(g_fontGSmall, 19.0f, lbl) + 20.0f, cxr = sx + sw - cwid;
+            Hit c = HitRect("##gm_cam", cxr, sy, cwid, 30.0f);
+            const unsigned col = confirming || c.hot ? 0xF08A80 : 0x9BE36A;
+            s_dl->AddRect(P(cxr, sy), P(cxr + cwid, sy + 30.0f), Rgb(col, 170), 4.0f * s_k, ImDrawCornerFlags_All, 1.2f);
+            Text(g_fontGSmall, 19.0f, cxr + cwid * 0.5f, sy + 15.0f, Rgb(col), lbl, AL_M, cwid - 8.0f);
+            if (c.hot) ImGui::SetTooltip("%s", Tr(STR_GAMES_CAM_TIP));
+            if (c.pressed) {
+                if (confirming) { gm.reqDeleteCam = true; s_camConfirm = -1.0; }
+                else s_camConfirm = now + 3.0;
+            }
+        }
     }
 
     // reglages (2026-09-26) : sensibilite (+ inversion Y a droite), zone morte,
@@ -1379,6 +1447,121 @@ void DrawUiGlossyHowTo(int& activeTab, float screenW, float screenH) {
 }
 
 // ============================================================================
+// GUIDE (Windows "How it works", 2026-11-18): same frame as the page above, the
+// content comes from the caller (two guides, one step per page).
+// ============================================================================
+void DrawUiGlossyGuide(GlossyGuideModel& gm, int& activeTab, float screenW, float screenH) {
+    (void)screenH;
+    s_k  = screenW / 1280.0f;
+    s_dl = ImGui::GetWindowDrawList();
+    s_blockHits = false;
+    HeaderAndTabs(activeTab, false);
+    if (gm.guide < 0 || gm.guide > 1) gm.guide = 0;
+    const int count = gm.stepCount[gm.guide];
+    if (gm.step >= count) gm.step = count - 1;
+    if (gm.step < 0) gm.step = 0;
+    char buf[64];
+
+    // --- bar: the two guides, then "3 / 8" and the arrows ----------------------
+    const GlRect& bar = GL_BarreInfo;
+    ImgAt(GA_BAR_INFO, bar);
+    const float barCy = bar.y + bar.h * 0.5f;
+    {
+        float fx = bar.x + 20.0f;
+        for (int k = 0; k < 2; k++) {
+            const float w = TextW(g_fontGBodyM, 24.0f, gm.guideName[k]) + 28.0f;
+            sprintf(buf, "##guide_pick%d", k);
+            Hit h = HitRect(buf, fx, bar.y + 8.0f, w, bar.h - 16.0f);
+            const bool on = gm.guide == k;
+            if (on || h.hot) {
+                s_dl->AddRectFilled(P(fx, bar.y + 8.0f), P(fx + w, bar.y + bar.h - 8.0f), Rgb(kGold, on ? 40 : 20), 4.0f * s_k);
+                s_dl->AddRect(P(fx, bar.y + 8.0f), P(fx + w, bar.y + bar.h - 8.0f), Rgb(kGold, on ? 220 : 120), 4.0f * s_k, ImDrawCornerFlags_All, 1.2f);
+            }
+            Text(on ? g_fontGBodyM : g_fontGBody, 24.0f, fx + w * 0.5f, barCy, Rgb(on ? kGold : kTxt), gm.guideName[k], AL_M);
+            if (h.pressed && !on) { gm.guide = k; gm.step = 0; }
+            fx += w + 10.0f;
+        }
+        Text(g_fontGSmall, 20.0f, fx + 14.0f, barCy, Rgb(kTxt2), gm.intro[gm.guide], AL_L, bar.x + bar.w - 150.0f - fx);
+    }
+    const int n = gm.stepCount[gm.guide];
+    bool goPrev = false, goNext = false;
+    {
+        const float right = bar.x + bar.w - 20.0f;
+        Hit hn = HitRect("##guide_next", right - 30.0f, bar.y + 6.0f, 30.0f, bar.h - 12.0f);
+        Hit hp = HitRect("##guide_prev", right - 66.0f, bar.y + 6.0f, 30.0f, bar.h - 12.0f);
+        Text(g_fontGTitle, 34.0f, right - 15.0f, barCy - 2.0f, Rgb(gm.step < n - 1 ? (hn.hot ? kGold : kTxt) : 0x3A4A5E), "\xE2\x80\xBA", AL_M);
+        Text(g_fontGTitle, 34.0f, right - 51.0f, barCy - 2.0f, Rgb(gm.step > 0 ? (hp.hot ? kGold : kTxt) : 0x3A4A5E), "\xE2\x80\xB9", AL_M);
+        sprintf(buf, "%d / %d", gm.step + 1, n);
+        Text(g_fontGBody, 24.0f, right - 80.0f, barCy, Rgb(kTxt2), buf, AL_R);
+        goNext = hn.pressed;
+        goPrev = hp.pressed;
+    }
+    if (n <= 0) return;
+    const GlossyGuideStep& st = gm.steps[gm.guide][gm.step];
+
+    // --- the step: number, title, text -----------------------------------------
+    const float x = 44.0f, y = 156.0f, w = 752.0f, h = 430.0f;
+    Card(x, y, w, h);
+    StepNumber(x + 40.0f, y + 44.0f, gm.step + 1);
+    Text(g_fontGTitle, 36.0f, x + 76.0f, y + 44.0f, Rgb(0xF2F5F8), st.title, AL_L, w - 96.0f);
+    s_dl->AddLine(P(x + 24.0f, y + 78.0f), P(x + w - 24.0f, y + 78.0f), Rgb(0x2C3B4F), 1.0f);
+    {   // one paragraph per line of the text, a gold dot in front of each
+        float ty = y + 96.0f;
+        const char* a = st.text;
+        while (a && *a) {
+            const char* e = strchr(a, '\n');
+            std::string para = e ? std::string(a, e) : std::string(a);
+            s_dl->AddCircleFilled(P(x + 34.0f, ty + 15.0f), 3.5f * s_k, Rgb(kGold), 12);
+            ty += TextWrap(g_fontGBody, 26.0f, x + 48.0f, ty, w - 76.0f, Rgb(kTxt), para.c_str()) + 16.0f;
+            a = e ? e + 1 : nullptr;
+        }
+    }
+
+    // --- picture on the right ----------------------------------------------------
+    const float px = 816.0f, py = 150.0f, pw = 420.0f, ph = 442.0f;
+    Img(GA_GAMES_PANEL, px, py);
+    {
+        int ids[4], cnt = 0;
+        for (int i = 0; i < 4; i++) if (st.art[i] >= 0 && st.art[i] < GA_COUNT) ids[cnt++] = st.art[i];
+        const float cx = px + pw * 0.5f, cy = py + ph * 0.5f;
+        if (cnt == 1 && AssetW(ids[0]) > 200) {   // one big picture: fit the panel
+            const float aw = (float)AssetW(ids[0]), ah = (float)AssetH(ids[0]);
+            float sc = (pw - 40.0f) / aw;
+            if (ah * sc > ph - 40.0f) sc = (ph - 40.0f) / ah;
+            ImgScaled(ids[0], cx - aw * sc * 0.5f, cy - ah * sc * 0.5f, aw * sc, ah * sc);
+        } else if (cnt > 0) {   // small pictures (keys, icons) side by side, twice their size
+            float total = 0.0f;
+            for (int i = 0; i < cnt; i++) total += AssetW(ids[i]) * 2.0f + (i ? 16.0f : 0.0f);
+            float ix = cx - total * 0.5f;
+            for (int i = 0; i < cnt; i++) {
+                const float aw = AssetW(ids[i]) * 2.0f, ah = AssetH(ids[i]) * 2.0f;
+                ImgScaled(ids[i], ix, cy - ah * 0.5f, aw, ah);
+                ix += aw + 16.0f;
+            }
+        }
+    }
+
+    // --- bottom: previous / dots / next ------------------------------------------
+    const float by = 604.0f;
+    if (gm.step > 0 && PgButton("##guide_prevbtn", x, by, false, gm.prevLabel)) goPrev = true;
+    if (gm.step < n - 1 && PgButton("##guide_nextbtn", x + w - 234.0f, by, false, gm.nextLabel, true)) goNext = true;
+    {
+        const float dx = 22.0f, d0 = x + w * 0.5f - dx * (n - 1) * 0.5f;
+        for (int i = 0; i < n; i++) {
+            sprintf(buf, "##guide_dot%d", i);
+            Hit hd = HitRect(buf, d0 + dx * i - 9.0f, by + 11.0f, 18.0f, 18.0f);
+            const bool on = i == gm.step;
+            s_dl->AddCircleFilled(P(d0 + dx * i, by + 20.0f), (on ? 6.0f : 4.5f) * s_k, Rgb(on ? kGold : (hd.hot ? kTxt : 0x3A4A5E)), 16);
+            if (hd.pressed) gm.step = i;
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_LeftArrow), false)) goPrev = true;
+    if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_RightArrow), false)) goNext = true;
+    if (goPrev && gm.step > 0) gm.step--;
+    if (goNext && gm.step < n - 1) gm.step++;
+}
+
+// ============================================================================
 // PAGE SOUTENIR (2026-09-25)
 //
 // Mises a jour : la console NE PEUT PAS interroger GitHub elle-meme. GitHub
@@ -1554,6 +1737,37 @@ bool DrawUiGlossySplash(float t, float screenW, float screenH, const char* versi
 }
 
 // Bandeau d'information en bas d'ecran (2026-09-26), par-dessus la page.
+// News-style band at the bottom of the screen (2026-10-20, idea HB): the
+// plugin is not running, and why. `label` stays on the left, `msg` scrolls.
+void DrawUiGlossyTicker(const char* label, const char* msg, float timeSec, float screenW, float screenH) {
+    (void)screenH;
+    if (!msg || !msg[0]) return;
+    s_k  = screenW / 1280.0f;
+    s_dl = ImGui::GetForegroundDrawList();
+    const float y = 648.0f, h = 40.0f, cy = y + h * 0.5f;   // inside the TV safe area
+    s_dl->AddRectFilled(P(0.0f, y), P(1280.0f, y + h), IM_COL32(60, 8, 12, 235));
+    s_dl->AddLine(P(0.0f, y), P(1280.0f, y), Rgb(0xF0605A, 230), 2.0f * s_k);
+    // Label capsule (pulses gently so the eye finds it)
+    const float pulse = 0.75f + 0.25f * sinf(timeSec * 3.3f);
+    const float lw = TextW(g_fontGBodyM, 22.0f, label) + 36.0f;
+    s_dl->AddRectFilled(P(0.0f, y), P(lw, y + h), Rgb(0xD23A35, (int)(255 * pulse)));
+    Text(g_fontGBodyM, 22.0f, 18.0f, cy, Rgb(kWhite), label);
+    // Scrolling text, repeated, clipped to the right of the label
+    char line[1024];
+    size_t n = strlen(msg);
+    if (n > sizeof(line) - 32) n = sizeof(line) - 32;
+    memcpy(line, msg, n);
+    strcpy(line + n, "     \xC2\xB7     ");
+    const float tw = TextW(g_fontGBody, 22.0f, line);
+    if (tw <= 0.0f) return;
+    const float speed = 70.0f;   // canvas pixels per second
+    const float off = fmodf(timeSec * speed, tw);
+    s_dl->PushClipRect(P(lw + 8.0f, y), P(1280.0f, y + h), true);
+    for (float x = lw + 8.0f - off; x < 1280.0f; x += tw)
+        Text(g_fontGBody, 22.0f, x, cy, Rgb(kMsg), line);
+    s_dl->PopClipRect();
+}
+
 void DrawUiGlossyToast(const char* msg, float alpha, float screenW, float screenH) {
     (void)screenH;
     if (!msg || !msg[0] || alpha <= 0.0f) return;
@@ -1564,4 +1778,908 @@ void DrawUiGlossyToast(const char* msg, float alpha, float screenW, float screen
     s_dl->AddRectFilled(P(x, y), P(x + w, y + h), IM_COL32(10, 16, 26, (int)(alpha * 235.0f)), 8.0f * s_k);
     s_dl->AddRect(P(x, y), P(x + w, y + h), Rgb(kGold, (int)(alpha * 220.0f)), 8.0f * s_k, ImDrawCornerFlags_All, 1.5f);
     Text(g_fontGBodyM, 24.0f, 640.0f, y + h * 0.5f, Rgb(kTxt, a), msg, AL_M);
+}
+
+
+// ============================================================================
+// PAGE AFFICHAGE EN JEU (2026-11-01) : apercu a gauche, reglages a droite.
+// ============================================================================
+namespace {
+
+float OvChipW(const char* label) { return TextW(g_fontGBody, 20.0f, label) + 26.0f; }
+
+// Pastille cliquable ; sel = choix actif (dore).
+bool OvChip(const char* id, float x, float y, const char* label, bool sel) {
+    const float w = OvChipW(label), h = 32.0f;
+    Hit hit = HitRect(id, x, y, w, h);
+    const bool lit = sel || hit.hot;
+    // Glossy pill: soft glow when lit, vertical gradient, bright top edge.
+    if (lit) {
+        s_dl->AddRect(P(x - 3.0f, y - 3.0f), P(x + w + 3.0f, y + h + 3.0f), Rgb(kGold, 40), 6.0f * s_k, ImDrawCornerFlags_All, 3.0f);
+        s_dl->AddRect(P(x - 1.5f, y - 1.5f), P(x + w + 1.5f, y + h + 1.5f), Rgb(kGold, 90), 5.0f * s_k, ImDrawCornerFlags_All, 2.0f);
+    }
+    s_dl->AddRectFilled(P(x, y), P(x + w, y + h), Rgb(0x0A1424), 4.0f * s_k);
+    s_dl->AddRectFilledMultiColor(P(x + 1.0f, y + 1.0f), P(x + w - 1.0f, y + h - 1.0f),
+        Rgb(sel ? 0x5A4A18 : 0x2A4C7C), Rgb(sel ? 0x5A4A18 : 0x2A4C7C), Rgb(sel ? 0x1E1808 : 0x0F2142), Rgb(sel ? 0x1E1808 : 0x0F2142));
+    s_dl->AddRectFilled(P(x + 3.0f, y + 2.0f), P(x + w - 3.0f, y + h * 0.45f), Rgb(0xFFFFFF, sel ? 26 : 18), 3.0f * s_k);
+    s_dl->AddRect(P(x, y), P(x + w, y + h), Rgb(lit ? kGold : 0x3F66A0), 4.0f * s_k, ImDrawCornerFlags_All, sel ? 1.6f : 1.0f);
+    Text(g_fontGBody, 20.0f, x + w * 0.5f, y + h * 0.5f, Rgb(lit ? kGold : 0xC8D4E6), label, AL_M, w - 6.0f);
+    return hit.pressed;
+}
+
+bool OvSwatch(const char* id, float x, float y, unsigned rgb) {
+    Hit hit = HitRect(id, x, y, 46.0f, 30.0f);
+    s_dl->AddRectFilled(P(x, y), P(x + 46.0f, y + 30.0f), Rgb(rgb), 3.0f * s_k);
+    s_dl->AddRect(P(x, y), P(x + 46.0f, y + 30.0f), hit.hot ? Rgb(kGold) : Rgb(0xFFFFFF, 120), 3.0f * s_k, ImDrawCornerFlags_All, hit.hot ? 2.0f : 1.0f);
+    return hit.pressed;
+}
+
+// 3 x 3 positions ; renvoie la case cliquee (rangee * 3 + colonne) ou -1.
+int OvGrid(const char* id, float x, float y, int selCol, int selRow) {
+    int clicked = -1;
+    char b[32];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) {
+            const float gx = x + c * 26.0f, gy = y + r * 18.0f;
+            sprintf(b, "%s%d", id, r * 3 + c);
+            Hit hit = HitRect(b, gx, gy, 22.0f, 14.0f);
+            const bool on = (c == selCol && r == selRow);
+            s_dl->AddRectFilled(P(gx, gy), P(gx + 22.0f, gy + 14.0f), Rgb(on ? kGold : (hit.hot ? 0x2F4A70 : 0x0E1A2E)), 2.0f * s_k);
+            s_dl->AddRect(P(gx, gy), P(gx + 22.0f, gy + 14.0f), Rgb(on ? kGold : 0x35527E), 2.0f * s_k, ImDrawCornerFlags_All, 1.0f);
+            if (hit.pressed) clicked = r * 3 + c;
+        }
+    return clicked;
+}
+
+void OvLabel(float x, float cy, const char* title, const char* hint) {
+    Text(g_fontGBodyM, 21.0f, x, cy - (hint ? 8.0f : 0.0f), Rgb(kTxt), title, AL_L, 128.0f);
+    if (hint) Text(g_fontGSmall, 15.0f, x, cy + 11.0f, Rgb(kTxt3), hint, AL_L, 130.0f);
+}
+
+// What the game will show, at 600 / 1280 of the real screen.
+unsigned OvClampPos(float v, float maxV) { return (unsigned)(v < 0.0f ? 0.0f : (v > maxV ? maxV : v)); }
+
+// Drag one block with the mouse: the grab offset is kept so it does not jump.
+// (px, py) = block corner in canvas units; returns true while it is being dragged.
+bool OvDrag(const char* id, float px, float py, float bw, float bh, float* gx, float* gy, float* outX, float* outY) {
+    Hit hit = HitRect(id, px, py, bw, bh);
+    if (ImGui::IsItemActivated()) {
+        *gx = ImGui::GetIO().MousePos.x / s_k - px;
+        *gy = ImGui::GetIO().MousePos.y / s_k - py;
+    }
+    if (hit.hot) s_dl->AddRect(P(px - 2.0f, py - 2.0f), P(px + bw + 2.0f, py + bh + 2.0f), Rgb(kGold, hit.active ? 255 : 160), 3.0f * s_k, ImDrawCornerFlags_All, 1.5f);
+    if (!hit.active) return false;
+    *outX = ImGui::GetIO().MousePos.x / s_k - *gx;
+    *outY = ImGui::GetIO().MousePos.y / s_k - *gy;
+    return true;
+}
+
+void OvPreview(OverlaySettings& s, ImTextureID tex, ImTextureID overlay, float x, float y, float w, float h) {
+    const float k = w / 1280.0f, ky = h / 720.0f;
+    s_dl->PushClipRect(P(x, y), P(x + w, y + h), true);
+    if (tex) {
+        s_dl->AddImage(tex, P(x, y), P(x + w, y + h));   // a real game capture
+    } else {
+        s_dl->AddRectFilledMultiColor(P(x, y), P(x + w, y + h * 0.5f), Rgb(0x5B7EA8), Rgb(0x5B7EA8), Rgb(0xA9B79A), Rgb(0xA9B79A));
+        s_dl->AddRectFilledMultiColor(P(x, y + h * 0.5f), P(x + w, y + h), Rgb(0x6D6A55), Rgb(0x6D6A55), Rgb(0x3C3A30), Rgb(0x3C3A30));
+        const float bx[4] = { 20.0f, 150.0f, 330.0f, 470.0f }, bw[4] = { 80.0f, 120.0f, 90.0f, 110.0f }, bh[4] = { 110.0f, 80.0f, 130.0f, 95.0f };
+        for (int i = 0; i < 4; i++)
+            s_dl->AddRectFilled(P(x + bx[i], y + h * 0.5f - bh[i]), P(x + bx[i] + bw[i], y + h * 0.5f), Rgb(0x8A7C68));
+    }
+    // The in-game drawing itself (overlay_preview.cpp, same code as the plugin), uploaded when the look changes.
+    if (overlay) s_dl->AddImage(overlay, P(x, y), P(x + w, y + h));
+    s_dl->PopClipRect();
+
+    // Drag the blocks on the preview; the real X / Y are what gets saved.
+    static float s_gkx = 0, s_gky = 0;
+    float nx, ny;
+    if (s.showKeys && OvDrag("##ov_dragk", x + s.keysX * k, y + s.keysY * ky, 170.0f, 62.0f, &s_gkx, &s_gky, &nx, &ny)) {
+        s.keysX = OvClampPos((nx - x) / k, 790.0f);
+        s.keysY = OvClampPos((ny - y) / ky, 590.0f);
+    }
+}
+
+} // namespace
+
+// Header and tabs only, for a page drawn elsewhere (the Windows Studio's In-game display page).
+void UiGlossyHeader(int& activeTab, float screenW) {
+    s_k  = screenW / 1280.0f;
+    s_dl = ImGui::GetWindowDrawList();
+    s_blockHits = false;
+    HeaderAndTabs(activeTab, false);
+}
+
+void DrawUiGlossyOverlay(GlossyOverlayModel& om, int& activeTab, float screenW, float screenH) {
+    (void)screenH;
+    s_k  = screenW / 1280.0f;
+    s_dl = ImGui::GetWindowDrawList();
+    s_blockHits = false;
+    HeaderAndTabs(activeTab, false);
+    if (!om.s) return;
+    OverlaySettings& s = *om.s;
+    char buf[64];
+
+    const GlRect& bar = GL_BarreInfo;
+    ImgAt(GA_BAR_INFO, bar);
+    Text(g_fontGBody, 22.0f, bar.x + bar.w * 0.5f, bar.y + bar.h * 0.5f, Rgb(kTxt), Tr(STR_OV_HEAD), AL_M, bar.w - 40.0f);
+
+    // --- Preview (left) ------------------------------------------------------------
+    {
+        const float x = 44.0f, y = 152.0f, w = 640.0f, h = 514.0f;
+        Card(x, y, w, h);
+        Text(g_fontGTitle, 30.0f, x + 20.0f, y + 30.0f, Rgb(kGold), Tr(STR_OV_PREVIEW));
+        OvPreview(s, om.previewTex, om.overlayTex, x + 20.0f, y + 58.0f, 600.0f, 340.0f);
+        // exact X / Y under the preview, then the drag hint and the shortcut
+        char nm[16], hk[96];
+        sprintf(buf, "%s  X %u  Y %u", Tr(s.showPad ? STR_OV_C_PAD : STR_OV_C_KEYS), s.keysX, s.keysY);
+        Text(g_fontGBodyM, 19.0f, x + 20.0f, y + 414.0f, Rgb(kTxt), buf, AL_L, w - 40.0f);
+        TextWrap(g_fontGSmall, 17.0f, x + 20.0f, y + 430.0f, w - 40.0f, Rgb(kTxt3), Tr(STR_OV_DRAG));
+        sprintf(hk, Tr(STR_OV_HK_LINE), OverlayKeyName(s.hotkey, nm, sizeof(nm)));
+        Text(g_fontGBodyM, 19.0f, x + 20.0f, y + 466.0f, Rgb(kGold), hk, AL_L, w - 40.0f);
+        sprintf(hk, Tr(STR_OV_HK_INFO), nm);
+        Text(g_fontGBodyM, 19.0f, x + 20.0f, y + 490.0f, Rgb(kGold), hk, AL_L, w - 40.0f);
+    }
+
+    // --- Settings (right) ----------------------------------------------------------
+    const float cx = 700.0f, cy0 = 152.0f, cw = 536.0f, ch = 514.0f;
+    Card(cx, cy0, cw, ch);
+    Text(g_fontGTitle, 30.0f, cx + 20.0f, cy0 + 30.0f, Rgb(kGold), Tr(STR_OV_SETTINGS));
+    const float lx = cx + 20.0f, vx = cx + 160.0f, vmax = cx + cw - 16.0f;
+    float y = cy0 + 62.0f;
+
+    // Content: aim panel and console info, then ONE input-drawing choice (learning aid)
+    OvLabel(lx, y + 16.0f, Tr(STR_OV_CONTENT), 0);
+    {
+        float x = vx;
+        if (OvChip("##ov_cs", x, y, Tr(STR_OV_C_STATS), s.showStats)) s.showStats = !s.showStats;
+    }
+    y += 42.0f;
+    OvLabel(lx, y + 16.0f, Tr(STR_OV_HELP), 0);
+    {
+        float x = vx;
+        const bool none = !s.showKeys && !s.showPad;
+        if (OvChip("##ov_h0", x, y, Tr(STR_OV_H_NONE), none)) s.showKeys = s.showPad = false;
+        x += OvChipW(Tr(STR_OV_H_NONE)) + 8.0f;
+        if (OvChip("##ov_h1", x, y, Tr(STR_OV_C_KEYS), s.showKeys)) { s.showKeys = true; s.showPad = false; }
+        x += OvChipW(Tr(STR_OV_C_KEYS)) + 8.0f;
+        if (OvChip("##ov_h2", x, y, Tr(STR_OV_C_PAD), s.showPad)) { s.showPad = true; s.showKeys = false; }
+    }
+    y += 42.0f;
+
+    // Theme: five chips, wrapped if they overflow
+    OvLabel(lx, y + 16.0f, Tr(STR_OV_THEME), 0);
+    {
+        const StrId names[5] = { STR_OV_TH0, STR_OV_TH1, STR_OV_TH2, STR_OV_TH3, STR_OV_TH4 };
+        const int cur = OverlayThemeOf(s);
+        float x = vx, yy = y;
+        for (int i = 0; i < 5; i++) {
+            const float w = OvChipW(Tr(names[i]));
+            if (x + w > vmax) { x = vx; yy += 38.0f; }
+            sprintf(buf, "##ov_th%d", i);
+            if (OvChip(buf, x, yy, Tr(names[i]), cur == i)) { s.colorOn = kOverlayThemes[i][0]; s.colorOff = kOverlayThemes[i][1]; }
+            x += w + 6.0f;
+        }
+        y = yy + 42.0f;
+    }
+
+    // Colours: a click on a swatch moves to the next palette colour
+    OvLabel(lx, y + 15.0f, Tr(STR_OV_COLORS), Tr(STR_OV_COL_HINT));
+    {
+        unsigned* cols[2] = { &s.colorOn, &s.colorOff };
+        for (int i = 0; i < 2; i++) {
+            sprintf(buf, "##ov_col%d", i);
+            if (OvSwatch(buf, vx + i * 56.0f, y, *cols[i])) {
+                int at = -1;
+                for (int p = 0; p < 8; p++) if (kOverlayPalette[p] == *cols[i]) at = p;
+                *cols[i] = kOverlayPalette[(at + 1) & 7];
+            }
+        }
+        Text(g_fontGSmall, 15.0f, vx + 118.0f, y + 15.0f, Rgb(kTxt3), Tr(STR_OV_CLICK_COL), AL_L, vmax - vx - 118.0f);
+    }
+    y += 50.0f;
+
+    // Position: keys, then panel
+    OvLabel(lx, y + 25.0f, Tr(STR_OV_POS), Tr(STR_OV_POS_HINT));
+    {
+        const int kc = OverlayGridIndex(s.keysX, kOverlayKeysXs), kr = OverlayGridIndex(s.keysY, kOverlayKeysYs);
+        const int hit = OvGrid("##ov_pk", vx, y, kc, kr);
+        if (hit >= 0) { s.keysX = kOverlayKeysXs[hit % 3]; s.keysY = kOverlayKeysYs[hit / 3]; }
+    }
+    y += 62.0f;
+
+    // Key style
+    OvLabel(lx, y + 16.0f, Tr(STR_OV_STYLE), 0);
+    {
+        float x = vx;
+        if (OvChip("##ov_s1", x, y, Tr(STR_OV_ST_IMG), s.style == 1)) s.style = 1;
+        x += OvChipW(Tr(STR_OV_ST_IMG)) + 8.0f;
+        if (OvChip("##ov_s0", x, y, Tr(STR_OV_ST_DRAW), s.style == 0)) s.style = 0;
+    }
+    y += 42.0f;
+
+    // Show / hide shortcut: "Change" waits for the next key press
+    OvLabel(lx, y + 15.0f, Tr(STR_OV_HOTKEY), Tr(STR_OV_HOTKEY_HINT));
+    {
+        if (om.capturing && om.keyEvent > 0) {
+            // Only modifier keys (E0-E7, the Windows key is E3 or E7) are stored: the plugin
+            // reads any other key as Windows. Esc cancels; other keys are ignored.
+            if (om.keyEvent >= 0xE0 && om.keyEvent <= 0xE7) { s.hotkey = (unsigned)om.keyEvent; om.capturing = false; }
+            else if (om.keyEvent == 0x29) om.capturing = false;
+        }
+        char name[16];
+        const char* shown = om.capturing ? Tr(STR_OV_PRESS) : OverlayKeyName(s.hotkey, name, sizeof(name));
+        const float w = OvChipW(shown) < 70.0f ? 70.0f : OvChipW(shown);
+        s_dl->AddRectFilled(P(vx, y), P(vx + w, y + 32.0f), Rgb(0x0A1424), 4.0f * s_k);
+        s_dl->AddRect(P(vx, y), P(vx + w, y + 32.0f), Rgb(0x2F4A70), 4.0f * s_k, ImDrawCornerFlags_All, 1.0f);
+        Text(g_fontGBodyM, 20.0f, vx + w * 0.5f, y + 16.0f, Rgb(kGold), shown, AL_M, w - 6.0f);
+        if (OvChip("##ov_hk", vx + w + 8.0f, y, Tr(STR_OV_CHANGE), om.capturing)) om.capturing = !om.capturing;
+    }
+
+    // Save / Reset + result
+    const float by = cy0 + ch - 80.0f;
+    if (om.savedAt >= 0.0 && ImGui::GetTime() - om.savedAt < 6.0)
+        Text(g_fontGSmall, 17.0f, lx, by + 46.0f, Rgb(om.savedOk ? 0x9BE36A : 0xF0605A), Tr(om.savedOk ? STR_OV_SAVED : STR_OV_SAVE_FAIL), AL_L, cw - 40.0f);
+    {
+        const float bw = (cw - 50.0f) * 0.5f;
+        GlRect r1 = { lx, by, bw, 42.0f }, t1 = { lx + bw * 0.5f, by + 21.0f, 0.0f, 0.0f };
+        if (Button("##ov_reset", r1, t1, GA_BTN_HALF, GA_BTN_HALF_F, Tr(STR_OV_RESET))) { s = OverlaySettings(); om.capturing = false; }
+        GlRect r2 = { lx + bw + 10.0f, by, bw, 42.0f }, t2 = { lx + bw * 1.5f + 10.0f, by + 21.0f, 0.0f, 0.0f };
+        if (Button("##ov_save", r2, t2, GA_BTN_HALF, GA_BTN_HALF_F, Tr(STR_OV_SAVE), true)) om.reqSave = true;
+    }
+}
+
+// ============================================================================
+// USB controller page (2026-11-03; redone 2026-11-06 with the components of the
+// keyboard & mouse page: same cells, badges, Assistant button, pad render, slider
+// panel, mouse-style cells) and its macro editor (up to 64 steps per macro).
+// ============================================================================
+static const char* const kPadLbl[PAD_CELLS] = { "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "L3", "R3",
+                                                "START", "BACK", "XBOX", "D-Up", "D-Down", "D-Left", "D-Right" };
+
+// A cell asset stretched to width w: both caps stay as drawn, the middle is stretched.
+static void Cell9(int id, float x, float y, float w, int alpha = 255) {
+    if (!Has(id)) return;
+    const UiSkinTex& t = s_tex[id];
+    const GlossyAssetSpec& a = g_glossyAssets[id];
+    const float p = (float)a.pad, cap = 10.0f, tw = (float)t.w;
+    const float y0 = y - p, y1 = y0 + (float)t.h;
+    const ImU32 col = IM_COL32(255, 255, 255, alpha);
+    const float u1 = (p + cap) / tw, u2 = (p + (float)a.w - cap) / tw;
+    s_dl->AddImage(t.tex, P(x - p, y0), P(x + cap, y1), ImVec2(0.0f, 0.0f), ImVec2(u1, 1.0f), col);
+    s_dl->AddImage(t.tex, P(x + cap, y0), P(x + w - cap, y1), ImVec2(u1, 0.0f), ImVec2(u2, 1.0f), col);
+    s_dl->AddImage(t.tex, P(x + w - cap, y0), P(x + w + p, y1), ImVec2(u2, 0.0f), ImVec2(1.0f, 1.0f), col);
+}
+
+// Same slider panel as the mouse settings, cut to topH + botH rows (its titles and rails
+// keep their offsets from the top).
+static void SlidersPanel(float x, float y, float topH, float botH) {
+    const int id = GA_GROUP_SLIDERS;
+    if (!Has(id)) return;
+    const UiSkinTex& t = s_tex[id];
+    const GlossyAssetSpec& a = g_glossyAssets[id];
+    const float p = (float)a.pad, tw = (float)t.w, th = (float)t.h;
+    s_dl->AddImage(t.tex, P(x - p, y - p), P(x - p + tw, y + topH), ImVec2(0.0f, 0.0f), ImVec2(1.0f, (p + topH) / th));
+    s_dl->AddImage(t.tex, P(x - p, y + topH), P(x - p + tw, y + topH + botH + p),
+                   ImVec2(0.0f, (p + (float)a.h - botH) / th), ImVec2(1.0f, 1.0f));
+}
+
+// Rail, fill and knob exactly as the mouse sliders draw them (ry = top of the rail).
+static void SliderRail(float x, float ry, float w, float frac) {
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    if (Has(GA_SLIDER_TRACK)) {
+        const UiSkinTex& tt = s_tex[GA_SLIDER_TRACK];
+        const float pad = (float)g_glossyAssets[GA_SLIDER_TRACK].pad;
+        s_dl->AddImage(tt.tex, P(x - pad, ry - pad), P(x + w + pad, ry - pad + tt.h));
+    }
+    if (Has(GA_SLIDER_FILL) && frac > 0.0f) {
+        const UiSkinTex& tf = s_tex[GA_SLIDER_FILL];
+        const float pad = (float)g_glossyAssets[GA_SLIDER_FILL].pad;
+        s_dl->AddImage(tf.tex, P(x - pad, ry - pad), P(x + frac * w + pad, ry - pad + tf.h), ImVec2(0.0f, 0.0f), ImVec2(frac, 1.0f));
+    }
+    ImgCentered(GA_SLIDER_KNOB, x + frac * w, ry + 3.0f);
+}
+
+// Key-style chip (white rounded, dark text), right aligned at `right`.
+static float KeyChip(float right, float cy, const char* s, bool dim) {
+    float w = TextW(g_fontGBodyM, 20.0f, s) + 14.0f;
+    if (w < 28.0f) w = 28.0f;
+    s_dl->AddRectFilled(P(right - w, cy - 13.0f), P(right, cy + 13.0f), Rgb(dim ? 0x46526A : 0xECEFF2), 6.0f * s_k);
+    Text(g_fontGBodyM, 20.0f, right - w * 0.5f, cy, Rgb(dim ? 0x96A2B6 : 0x1B2740), s, AL_M);
+    return right - w;
+}
+
+// The grid badge of a pad cell, scaled and centred.
+static void BadgeScaled(int cell, float cx, float cy, float sc, int alpha) {
+    const int id = kGridBadge[cell];
+    if (!Has(id)) return;
+    const UiSkinTex& t = s_tex[id];
+    const GlossyAssetSpec& a = g_glossyAssets[id];
+    const float hw = ((float)a.w * 0.5f + (float)a.pad) * sc, hh = ((float)a.h * 0.5f + (float)a.pad) * sc;
+    s_dl->AddImage(t.tex, P(cx - hw, cy - hh), P(cx + hw, cy + hh), ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), IM_COL32(255, 255, 255, alpha));
+}
+
+static void DrawStepsGlyph(float x, float y) {
+    const ImU32 c = Rgb(0x6FC3FF);
+    for (int i = 0; i < 3; i++) {
+        const float xx = x + 2.0f + (i == 2 ? 6.0f : 0.0f), yy = y + 3.0f + 8.0f * i, ww = (i == 1) ? 26.0f : 18.0f;
+        s_dl->AddRect(P(xx, yy), P(xx + ww, yy + 5.0f), c, 2.0f * s_k, ImDrawCornerFlags_All, 1.8f);
+    }
+}
+
+static float MsToFrac(int ms) {
+    if (ms < 16) ms = 16;
+    if (ms > 5000) ms = 5000;
+    return logf((float)ms / 16.0f) / logf(5000.0f / 16.0f);
+}
+static int FracToMs(float f) {
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    int v = (int)(16.0f * expf(f * logf(5000.0f / 16.0f)) + 0.5f);
+    if (v >= 1000) v = (v / 50) * 50; else if (v >= 200) v = (v / 10) * 10; else if (v >= 50) v = (v / 5) * 5;
+    return v < 16 ? 16 : (v > 5000 ? 5000 : v);
+}
+
+// Cells held now, through the pad's own mapping (bit i = cell i).
+static unsigned LiveCellMask(const GlossyPadModel& pm) {
+    unsigned m = 0;
+    for (int i = 0; i < PAD_CELLS; i++)
+        if (pm.btnIdx[i] >= 0 && (pm.liveMask & (1u << pm.btnIdx[i]))) m |= 1u << i;
+    return m;
+}
+
+// Display name of a pad cell: the D-pad names are translated, the others are the same everywhere.
+static const char* PadName(int i) {
+    switch (i) {
+        case 13: return Tr(STR_PAD_DUP);
+        case 14: return Tr(STR_PAD_DDOWN);
+        case 15: return Tr(STR_PAD_DLEFT);
+        case 16: return Tr(STR_PAD_DRIGHT);
+        default: return kPadLbl[i];
+    }
+}
+
+static void MaskText(unsigned mask, char* out) {   // "A + D-Right"
+    out[0] = 0;
+    for (int i = 0; i < PAD_CELLS; i++)
+        if (mask & (1u << i)) { if (out[0]) strcat(out, " + "); strcat(out, PadName(i)); }
+}
+
+// Pad glow of every held cell (the four D-pad cells share one glow).
+static void GlowMask(unsigned mask) {
+    bool dpad = false;
+    for (int i = 0; i < PAD_CELLS; i++) {
+        if (!(mask & (1u << i))) continue;
+        if (i >= 13) { if (dpad) continue; dpad = true; }
+        const GlPadPoint& p = GL_PAD_POINTS[i];
+        ImgCentered(p.glowAsset, p.x, p.y);
+    }
+}
+
+static int FreeTrigger(const GlossyPadModel& pm) {
+    for (int b = 0; b < 32; b++) {
+        bool used = false;
+        for (int i = 0; i < PAD_CELLS; i++) used = used || pm.btnIdx[i] == b;
+        for (int j = 0; j < pm.macroCount; j++) used = used || pm.macros[j].btn == b;
+        if (!used) return b;
+    }
+    return 0;
+}
+
+static void OpenEditor(GlossyPadModel& pm, int idx) {
+    pm.editMacro = idx; pm.editStep = 0; pm.stepScroll = 0;
+    pm.capTrigger = false; pm.recording = false; pm.testing = false;
+    pm.wizard = false; pm.captureCell = -1;
+}
+
+static void DeleteMacro(GlossyPadModel& pm, int i) {
+    for (int k = i; k + 1 < pm.macroCount; k++) pm.macros[k] = pm.macros[k + 1];
+    pm.macroCount--;
+    pm.reqSaveButtons = true;
+}
+
+static void MacroSummary(const GlossyPadMacro& mc, char* out) {   // "6 pas  ·  1.2 s"
+    int total = 0;
+    for (int s = 0; s < mc.stepCount; s++) total += mc.steps[s].ms;
+    char a[24];
+    sprintf(a, Tr(STR_PAD_STEPS_FMT), mc.stepCount);
+    if (total > 0) sprintf(out, "%s  \xC2\xB7  %d.%d s", a, total / 1000, (total % 1000) / 100);
+    else strcpy(out, a);
+}
+
+// ---------------------------------------------------------------------------------
+// Main page of a controller
+// ---------------------------------------------------------------------------------
+static void PadMainPage(GlossyPadModel& pm, double now, ImGuiIO& io, unsigned newBits) {
+    char buf[128];
+    const bool editable = pm.hasEntry && pm.hasAxes;
+
+    // capture: next pad button pressed while a cell waits
+    if (pm.captureCell >= 0) {
+        if (now > pm.captureUntil || !editable) { pm.captureCell = -1; pm.wizard = false; }
+        else if (pm.hasLive && newBits) {
+            int b = 0;
+            while (b < 31 && !(newBits & (1u << b))) b++;
+            pm.btnIdx[pm.captureCell] = b;
+            for (int j = 0; j < pm.macroCount; j++) if (pm.macros[j].btn == b) pm.macros[j].btn = FreeTrigger(pm);
+            pm.reqSaveButtons = true;
+            if (pm.wizard && pm.captureCell + 1 < PAD_CELLS) { pm.captureCell++; pm.captureUntil = now + 10.0; }
+            else { pm.captureCell = -1; pm.wizard = false; }
+        }
+    }
+    const bool capturing = pm.captureCell >= 0;
+
+    // ---- left column: title, Assistant, the 21 cells ------------------------------
+    DrawPadGlyph(GL_IcoTitreClavier.x, GL_IcoTitreClavier.y, GL_IcoTitreClavier.w, GL_IcoTitreClavier.h);
+    Text(g_fontGTitle, 37.0f, GL_TxtTitreClavier.x, GL_TxtTitreClavier.y, Rgb(0xF2F5F8), Tr(STR_PAD_TITLE));
+    ImgAt(GA_TITLE_RULE, GL_RegleClavier);
+    {
+        sprintf(buf, Tr(STR_PAD_WIZARD), PAD_CELLS);
+        if (Button("##gp_wiz", GL_BtnAssistant, GL_TxtAssistant, GA_BTN_WIDE, GA_BTN_WIDE_F, buf, pm.wizard) && editable && pm.hasLive) {
+            pm.wizard = !pm.wizard;
+            pm.captureCell = pm.wizard ? 0 : -1;
+            pm.captureUntil = now + 10.0;
+        }
+    }
+    int focusIdx = capturing ? pm.captureCell : -1;
+    for (int i = 0; i < 21; i++) {
+        const int col = i / 7, row = i % 7;
+        const float x = GL_CaseA.x + GL_KGRID_DX * col;
+        const float y = GL_CaseA.y + GL_KGRID_DY * row;
+        const float cyc = y + GL_CaseA.h * 0.5f;
+        const bool real = i < PAD_CELLS;
+        sprintf(buf, "##gp_cell%d", i);
+        Hit h = real ? HitRect(buf, x, y, GL_CaseA.w, GL_CaseA.h) : Hit();
+        const bool waiting = capturing && i == pm.captureCell;
+        const bool held = real && pm.hasLive && pm.btnIdx[i] >= 0 && (pm.liveMask & (1u << pm.btnIdx[i]));
+        const bool done = pm.wizard && i < pm.captureCell;
+        const bool lit = waiting || held || (h.hot && editable);
+        const int alpha = (real && editable) ? 255 : 120;
+        Img(lit ? GA_KCELL_F : (done ? GA_KCELL_DONE : GA_KCELL), x, y, alpha);
+        Img(kGridBadge[i], x + 8.0f, cyc - AssetH(kGridBadge[i]) * 0.5f, alpha);
+        const float kRight = x + GL_CaseA.w - 8.0f;
+        if (waiting) {
+            Text(g_fontGBodyM, 21.0f, kRight, cyc, Rgb(kGold), Tr(STR_GLOSSY_CAPTURE), AL_R, GL_CaseA.w - 60.0f);
+        } else {
+            const int b = real ? pm.btnIdx[i] : -1;
+            if (b >= 0) sprintf(buf, "B%d", b + 1); else strcpy(buf, "-");
+            KeyChip(kRight, cyc, buf, b < 0);
+        }
+        if (real && (held || (h.hot && focusIdx < 0))) focusIdx = i;
+        if (real && editable) {
+            if (h.pressed) {
+                if (pm.hasLive) { pm.captureCell = waiting ? -1 : i; pm.wizard = false; pm.captureUntil = now + 10.0; }
+                else { pm.btnIdx[i] = pm.btnIdx[i] >= 15 ? -1 : pm.btnIdx[i] + 1; pm.reqSaveButtons = true; }
+            }
+            if (h.rclick) { pm.btnIdx[i] = -1; pm.captureCell = -1; pm.reqSaveButtons = true; }
+            if (h.hot && !pm.hasLive) ImGui::SetTooltip("%s", Tr(STR_PAD_NOLIVE));
+        }
+    }
+
+    // ---- centre: the same white pad, the lit button, one status line --------------
+    ImgAt(GA_PAD_FRONT, GL_ImgManetteFace);
+    if (focusIdx >= 0 && focusIdx < PAD_CELLS) {
+        const GlPadPoint& p = GL_PAD_POINTS[focusIdx];
+        ImgCentered(p.glowAsset, p.x, p.y);
+        const int b = pm.btnIdx[focusIdx];
+        if (b >= 0) sprintf(buf, "  \xC2\xB7  B%d", b + 1); else strcpy(buf, "  \xC2\xB7  -");
+        const float w1 = TextW(g_fontGBodyM, 26.0f, PadName(focusIdx)), w2 = TextW(g_fontGBody, 25.0f, buf);
+        const float x = p.labelX - (w1 + w2) * 0.5f;
+        Text(g_fontGBodyM, 26.0f, x, p.labelY, Rgb(kGold), PadName(focusIdx));
+        Text(g_fontGBody, 25.0f, x + w1, p.labelY, Rgb(kTxt), buf);
+    }
+    if (!editable)      Text(g_fontGBody, 22.0f, 670.0f, 622.0f, Rgb(kMsg), Tr(STR_PAD_NOENTRY), AL_M, 500.0f);
+    else if (capturing) Text(g_fontGBody, 24.0f, 670.0f, 622.0f, Rgb(kMsg), Tr(STR_PAD_PRESS), AL_M, 500.0f);
+
+    // ---- right column: right stick (the mouse slider panel, one slider + invert Y) -
+    BadgeScaled(PAD_CELLS - 8, 975.0f, 175.0f, 1.0f, 255);   // R3 badge as the title icon
+    Text(g_fontGTitle, 37.0f, GL_TxtTitreSouris.x, GL_TxtTitreSouris.y, Rgb(0xF2F5F8), Tr(STR_PAD_STICK), AL_L, 240.0f);
+    ImgAt(GA_TITLE_RULE_S, GL_RegleSouris);
+    const float py = 206.0f;
+    SlidersPanel(956.0f, py, 72.0f, 28.0f);
+    {
+        Text(g_fontGTitle, 30.0f, 966.0f, py + 20.0f, Rgb(0xF2F5F8), Tr(STR_PAD_DZ), AL_L, 180.0f);
+        sprintf(buf, "%d %%", pm.deadzone / 100);
+        Text(g_fontGBodyM, 22.0f, 1232.0f, py + 22.0f, Rgb(kGold), buf, AL_R);
+        const float tx = 966.0f, tw = 266.0f, ry = py + 44.0f;
+        Hit h = HitRect("##gp_dz", tx - 10.0f, ry - 14.0f, tw + 20.0f, 34.0f);
+        if (h.active && editable) {
+            float f = (io.MousePos.x / s_k - tx) / tw;
+            if (f < 0.0f) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            pm.deadzone = ((int)(f * 100.0f + 0.5f)) * 100;
+        }
+        if (h.deactivated && editable) pm.reqSaveStick = true;
+        SliderRail(tx, ry, tw, pm.deadzone / 10000.0f);
+
+        const char* lbl = Tr(STR_GLOSSY_INVERT);
+        const float lw = TextW(g_fontGSmall, 20.0f, lbl), right = 1230.0f, cy = py + 85.0f, bx = right - lw - 24.0f;
+        Hit hi = HitRect("##gp_inv", bx - 4.0f, cy - 12.0f, lw + 32.0f, 24.0f);
+        s_dl->AddRect(P(bx, cy - 8.0f), P(bx + 16.0f, cy + 8.0f), Rgb(hi.hot ? kGold : 0x8FA2B8), 3.0f * s_k, ImDrawCornerFlags_All, 1.5f);
+        if (pm.invertRY) s_dl->AddRectFilled(P(bx + 4.0f, cy - 4.0f), P(bx + 12.0f, cy + 4.0f), Rgb(kGold), 2.0f * s_k);
+        Text(g_fontGSmall, 20.0f, right, cy, Rgb(hi.hot ? kGold : kTxt2), lbl, AL_R);
+        if (hi.pressed && editable) { pm.invertRY = !pm.invertRY; pm.reqSaveStick = true; }
+    }
+
+    // ---- right column: macros (mouse-style cells) -----------------------------------
+    DrawStepsGlyph(964.0f, 318.0f);
+    Text(g_fontGTitle, 37.0f, GL_TxtTitreSouris.x, 331.0f, Rgb(0xF2F5F8), Tr(STR_PAD_MACROS), AL_L, 240.0f);
+    { GlRect rule = { 960.0f, 352.0f, 276.0f, 1.0f }; ImgAt(GA_TITLE_RULE_S, rule); }
+    {
+        const int rows = 6;
+        const int items = pm.macroCount + (pm.macroCount < PAD_MACROS_MAX ? 1 : 0);
+        const float x = 962.0f, w = 276.0f, y0 = 364.0f, pitch = 46.0f;
+        const ImVec2 mp = io.MousePos;
+        if (io.MouseWheel != 0.0f && mp.x >= x * s_k && mp.x <= (x + w) * s_k && mp.y >= y0 * s_k && mp.y <= (y0 + rows * pitch) * s_k)
+            pm.macroScroll -= (int)(io.MouseWheel > 0.0f ? 1 : -1);
+        if (pm.macroScroll > items - rows) pm.macroScroll = items - rows;
+        if (pm.macroScroll < 0) pm.macroScroll = 0;
+        int del = -1;
+        for (int r = 0; r < rows; r++) {
+            const int k = pm.macroScroll + r;
+            if (k >= items) break;
+            const float y = y0 + pitch * r, cy = y + 20.0f;
+            if (k < pm.macroCount) {
+                GlossyPadMacro& mc = pm.macros[k];
+                sprintf(buf, "##gp_mac%d", k);
+                Hit h = HitRect(buf, x, y, w - 30.0f, 40.0f);
+                Cell9(h.hot ? GA_MCELL_S_F : GA_MCELL_S, x, y, w);
+                sprintf(buf, "B%d", mc.btn + 1);
+                KeyChip(x + 52.0f, cy, buf, false);
+                Text(g_fontGBody, 26.0f, x + 70.0f, cy, Rgb(h.hot ? kGold : kTxt3), "\xE2\x80\xBA", AL_M);
+                MacroSummary(mc, buf);
+                Text(g_fontGBody, 22.0f, x + 86.0f, cy, Rgb(kTxt), buf, AL_L, w - 86.0f - 34.0f);
+                char id[24];
+                sprintf(id, "##gp_macx%d", k);
+                Hit hx = HitRect(id, x + w - 30.0f, y, 30.0f, 40.0f);
+                Text(g_fontGBodyM, 22.0f, x + w - 16.0f, cy, Rgb(hx.hot ? 0xF0605A : kTxt3), "x", AL_M);
+                if (h.pressed) OpenEditor(pm, k);
+                if (hx.pressed || h.rclick) del = k;
+            } else {
+                Hit h = HitRect("##gp_madd", x, y, w, 40.0f);
+                Cell9(GA_MCELL_S_ADD, x, y, w, h.hot ? 255 : 170);
+                sprintf(buf, "+  %s", Tr(STR_PAD_ADD_MACRO));
+                Text(g_fontGBody, 22.0f, x + w * 0.5f, cy, Rgb(h.hot ? kGold : kTxt2), buf, AL_M, w - 20.0f);
+                if (h.pressed) {
+                    GlossyPadMacro& mc = pm.macros[pm.macroCount];
+                    mc.btn = FreeTrigger(pm); mc.stepCount = 1; mc.steps[0].mask = 1u; mc.steps[0].ms = 80;
+                    pm.macroCount++;
+                    OpenEditor(pm, pm.macroCount - 1);
+                    pm.capTrigger = pm.hasLive;   // pick the trigger button right away
+                    pm.reqSaveButtons = true;
+                }
+            }
+        }
+        if (del >= 0) DeleteMacro(pm, del);
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Macro editor: step list (left), the pad lit like the real page does (centre),
+// toggles of the 17 buttons + pause and the step duration (right).
+// ---------------------------------------------------------------------------------
+static void PadEditorPage(GlossyPadModel& pm, double now, ImGuiIO& io, unsigned newBits) {
+    char buf[160], id[32];
+    if (pm.editMacro < 0 || pm.editMacro >= pm.macroCount) { pm.editMacro = -1; return; }
+    GlossyPadMacro& mc = pm.macros[pm.editMacro];
+    static int s_lastStep = -1;
+
+    // ---- trigger button: the next pad button pressed -------------------------------
+    if (pm.capTrigger && pm.hasLive && newBits) {
+        int b = 0;
+        while (b < 31 && !(newBits & (1u << b))) b++;
+        bool taken = false;
+        for (int j = 0; j < pm.macroCount; j++) taken = taken || (j != pm.editMacro && pm.macros[j].btn == b);
+        if (!taken) {
+            for (int i = 0; i < PAD_CELLS; i++) if (pm.btnIdx[i] == b) pm.btnIdx[i] = -1;   // a macro trigger is not a plain button
+            mc.btn = b;
+            pm.capTrigger = false;
+            pm.reqSaveButtons = true;
+        }
+    }
+
+    // ---- recording: every change of the held cells becomes a step with its real time
+    if (pm.recording) {
+        const unsigned cm = LiveCellMask(pm);
+        bool stop = false;
+        if (!pm.recBegan) {
+            if (cm) { pm.recBegan = true; pm.recMask = cm; pm.recStart = now; mc.stepCount = 0; }
+        } else if (cm != pm.recMask) {
+            int ms = (int)((now - pm.recStart) * 1000.0 + 0.5);
+            if (ms < 16) ms = 16;
+            if (ms > 5000) ms = 5000;
+            mc.steps[mc.stepCount].mask = pm.recMask; mc.steps[mc.stepCount].ms = ms; mc.stepCount++;
+            pm.recMask = cm; pm.recStart = now;
+            if (mc.stepCount >= PAD_STEPS_MAX) stop = true;
+        } else if (cm == 0 && now - pm.recStart > 2.0) {
+            stop = true;   // released and quiet: the sequence is over
+        }
+        if (stop) {
+            pm.recording = false; pm.recBegan = false;
+            if (mc.stepCount > 0) pm.editStep = mc.stepCount - 1;
+            pm.reqSaveButtons = true;
+        }
+    }
+
+    // ---- test: replay the steps on the pad drawing (the plugin plays them in the game)
+    unsigned testMask = 0;
+    int testStep = -1;
+    if (pm.testing) {
+        const double t = (now - pm.testStart) * 1000.0;
+        double cum = 0.0;
+        for (int s = 0; s < mc.stepCount; s++) {
+            const double dur = mc.steps[s].ms > 0 ? (double)mc.steps[s].ms : 500.0;
+            if (t < cum + dur) { testStep = s; testMask = mc.steps[s].mask; break; }
+            cum += dur;
+        }
+        if (testStep < 0) pm.testing = false;
+    }
+
+    if (pm.editStep >= mc.stepCount) pm.editStep = mc.stepCount - 1;
+    if (pm.editStep < 0 && mc.stepCount > 0) pm.editStep = 0;
+    GlossyPadStep* cur = (pm.editStep >= 0 && pm.editStep < mc.stepCount) ? &mc.steps[pm.editStep] : 0;
+
+    // ======================= left column ===============================================
+    DrawStepsGlyph(GL_IcoTitreClavier.x + 2.0f, GL_IcoTitreClavier.y - 2.0f);
+    const float tw0 = Text(g_fontGTitle, 37.0f, GL_TxtTitreClavier.x, GL_TxtTitreClavier.y, Rgb(0xF2F5F8), Tr(STR_PAD_ED_TITLE));
+    {   // trigger chip: click, then press the button
+        const float cx0 = GL_TxtTitreClavier.x + tw0 + 16.0f, cy = GL_TxtTitreClavier.y;
+        if (pm.capTrigger) strcpy(buf, Tr(STR_PAD_TRIG_WAIT)); else sprintf(buf, "B%d", mc.btn + 1);
+        float w = TextW(g_fontGBodyM, 20.0f, buf) + 14.0f;
+        if (w < 28.0f) w = 28.0f;
+        Hit h = HitRect("##gp_trig", cx0, cy - 13.0f, w, 26.0f);
+        s_dl->AddRectFilled(P(cx0, cy - 13.0f), P(cx0 + w, cy + 13.0f), Rgb(pm.capTrigger ? 0x3A3216 : 0xECEFF2), 6.0f * s_k);
+        if (pm.capTrigger || h.hot) s_dl->AddRect(P(cx0, cy - 13.0f), P(cx0 + w, cy + 13.0f), Rgb(kGold), 6.0f * s_k, ImDrawCornerFlags_All, 1.5f);
+        Text(g_fontGBodyM, 20.0f, cx0 + w * 0.5f, cy, Rgb(pm.capTrigger ? kGold : 0x1B2740), buf, AL_M);
+        if (h.hot) ImGui::SetTooltip("%s", Tr(STR_PAD_TRIG_HINT));
+        if (h.pressed) {
+            if (pm.hasLive) pm.capTrigger = !pm.capTrigger;
+            else { mc.btn = (mc.btn + 1) % 16; pm.reqSaveButtons = true; }
+        }
+    }
+    ImgAt(GA_TITLE_RULE, GL_RegleClavier);
+    {
+        if (pm.recording) sprintf(buf, Tr(STR_PAD_REC_STOP), mc.stepCount);
+        else strcpy(buf, Tr(STR_PAD_REC));
+        const char* label = (pm.recording && !pm.recBegan) ? Tr(STR_PAD_REC_WAIT) : buf;
+        if (Button("##gp_rec", GL_BtnAssistant, GL_TxtAssistant, GA_BTN_WIDE, GA_BTN_WIDE_F, label, pm.recording) && pm.hasLive) {
+            if (pm.recording) {
+                if (pm.recBegan && pm.recMask && mc.stepCount < PAD_STEPS_MAX) {
+                    int ms = (int)((now - pm.recStart) * 1000.0 + 0.5);
+                    mc.steps[mc.stepCount].mask = pm.recMask; mc.steps[mc.stepCount].ms = ms < 16 ? 16 : (ms > 5000 ? 5000 : ms); mc.stepCount++;
+                }
+                pm.recording = false; pm.recBegan = false;
+                if (mc.stepCount > 0) pm.editStep = mc.stepCount - 1;
+                pm.reqSaveButtons = true;
+            } else {
+                pm.recording = true; pm.recBegan = false; pm.recMask = 0; pm.testing = false; pm.capTrigger = false;
+            }
+        }
+    }
+
+    // step list: 7 rows, the last item is "Add a step"
+    {
+        const int rows = 7;
+        const int items = mc.stepCount + (mc.stepCount < PAD_STEPS_MAX ? 1 : 0);
+        const float x = GL_CaseA.x, w = 344.0f, y0 = GL_CaseA.y;
+        if (pm.editStep != s_lastStep) {
+            s_lastStep = pm.editStep;
+            if (pm.editStep >= 0 && pm.editStep < pm.stepScroll) pm.stepScroll = pm.editStep;
+            if (pm.editStep >= pm.stepScroll + rows) pm.stepScroll = pm.editStep - rows + 1;
+        }
+        const ImVec2 mp = io.MousePos;
+        if (io.MouseWheel != 0.0f && mp.x >= x * s_k && mp.x <= (x + w) * s_k && mp.y >= y0 * s_k && mp.y <= (y0 + rows * GL_KGRID_DY) * s_k)
+            pm.stepScroll -= (int)(io.MouseWheel > 0.0f ? 1 : -1);
+        if (pm.stepScroll > items - rows) pm.stepScroll = items - rows;
+        if (pm.stepScroll < 0) pm.stepScroll = 0;
+        int mv = -1, dir = 0, del = -1;
+        for (int r = 0; r < rows; r++) {
+            const int k = pm.stepScroll + r;
+            if (k >= items) break;
+            const float y = y0 + GL_KGRID_DY * r, cy = y + GL_CaseA.h * 0.5f;
+            if (k < mc.stepCount) {
+                GlossyPadStep& st = mc.steps[k];
+                sprintf(id, "##gp_step%d", k);
+                Hit h = HitRect(id, x, y, w - 84.0f, GL_CaseA.h);
+                const bool sel = (k == pm.editStep), playing = (k == testStep);
+                Cell9((sel || h.hot || playing) ? GA_KCELL_F : GA_KCELL, x, y, w);
+                sprintf(buf, "%d", k + 1);
+                KeyChip(x + 38.0f, cy, buf, false);
+                if (st.mask == 0) {
+                    Text(g_fontGBody, 22.0f, x + 52.0f, cy, Rgb(kTxt3), Tr(STR_PAD_PAUSE), AL_L);
+                } else {
+                    float gx = x + 66.0f;
+                    int shown = 0;
+                    for (int i = 0; i < PAD_CELLS; i++) {
+                        if (!(st.mask & (1u << i))) continue;
+                        if (shown == 4) { Text(g_fontGBodyM, 20.0f, gx - 6.0f, cy, Rgb(kTxt2), "+", AL_L); break; }
+                        BadgeScaled(i, gx, cy, 0.85f, 255);
+                        gx += 33.0f; shown++;
+                    }
+                }
+                if (st.ms > 0) sprintf(buf, "%d ms", st.ms); else strcpy(buf, Tr(STR_PAD_HELD));
+                KeyChip(x + w - 86.0f, cy, buf, false);
+                sprintf(id, "##gp_stup%d", k);
+                Hit hu = HitRect(id, x + w - 78.0f, y + 8.0f, 24.0f, 30.0f);
+                sprintf(id, "##gp_stdn%d", k);
+                Hit hd = HitRect(id, x + w - 54.0f, y + 8.0f, 24.0f, 30.0f);
+                sprintf(id, "##gp_stx%d", k);
+                Hit hx = HitRect(id, x + w - 30.0f, y + 8.0f, 24.0f, 30.0f);
+                const float ax = x + w - 66.0f, bx = x + w - 42.0f;
+                s_dl->AddTriangleFilled(P(ax - 6.0f, cy + 4.0f), P(ax + 6.0f, cy + 4.0f), P(ax, cy - 5.0f), Rgb(hu.hot ? kGold : kTxt3));
+                s_dl->AddTriangleFilled(P(bx - 6.0f, cy - 4.0f), P(bx + 6.0f, cy - 4.0f), P(bx, cy + 5.0f), Rgb(hd.hot ? kGold : kTxt3));
+                Text(g_fontGBodyM, 22.0f, x + w - 18.0f, cy, Rgb(hx.hot ? 0xF0605A : kTxt3), "x", AL_M);
+                if (h.pressed) { pm.editStep = k; pm.testing = false; }
+                if (hu.pressed && k > 0) { mv = k; dir = -1; }
+                if (hd.pressed && k + 1 < mc.stepCount) { mv = k; dir = 1; }
+                if (hx.pressed) del = k;
+            } else {
+                Hit h = HitRect("##gp_stadd", x, y, w, GL_CaseA.h);
+                Cell9(GA_MCELL_S_ADD, x, y + 3.0f, w, h.hot ? 255 : 170);
+                sprintf(buf, "+  %s        %d / %d", Tr(STR_PAD_ADD_STEP), mc.stepCount, PAD_STEPS_MAX);
+                Text(g_fontGBody, 22.0f, x + w * 0.5f, cy, Rgb(h.hot ? kGold : kTxt2), buf, AL_M, w - 20.0f);
+                if (h.pressed) {
+                    mc.steps[mc.stepCount].mask = 0; mc.steps[mc.stepCount].ms = 80;
+                    pm.editStep = mc.stepCount; mc.stepCount++;
+                    pm.testing = false; pm.reqSaveButtons = true;
+                }
+            }
+        }
+        if (mv >= 0) {
+            GlossyPadStep tmp = mc.steps[mv]; mc.steps[mv] = mc.steps[mv + dir]; mc.steps[mv + dir] = tmp;
+            if (pm.editStep == mv) pm.editStep = mv + dir; else if (pm.editStep == mv + dir) pm.editStep = mv;
+            pm.reqSaveButtons = true;
+        }
+        if (del >= 0) {
+            for (int k = del; k + 1 < mc.stepCount; k++) mc.steps[k] = mc.steps[k + 1];
+            mc.stepCount--;
+            if (pm.editStep >= mc.stepCount) pm.editStep = mc.stepCount - 1;
+            pm.reqSaveButtons = true;
+        }
+    }
+
+    // ======================= centre ======================================================
+    ImgAt(GA_PAD_FRONT, GL_ImgManetteFace);
+    GlowMask(pm.testing ? testMask : (pm.recording ? LiveCellMask(pm) : (cur ? cur->mask : 0)));
+    {
+        const unsigned m = pm.testing ? testMask : (cur ? cur->mask : 0);
+        const int ms = pm.testing ? (testStep >= 0 ? mc.steps[testStep].ms : 0) : (cur ? cur->ms : 0);
+        if (cur || pm.testing) {
+            char names[96];
+            MaskText(m, names);
+            if (!names[0]) strcpy(names, Tr(STR_PAD_PAUSE));
+            char dur[24];
+            if (ms > 0) sprintf(dur, "%d ms", ms); else strcpy(dur, Tr(STR_PAD_HELD));
+            sprintf(buf, Tr(STR_PAD_ED_STEP), (pm.testing ? testStep : pm.editStep) + 1);
+            strcat(buf, "  \xC2\xB7  "); strcat(buf, names); strcat(buf, "  \xC2\xB7  "); strcat(buf, dur);
+            Text(g_fontGBody, 24.0f, 670.0f, 560.0f, Rgb(kTxt), buf, AL_M, 480.0f);
+        }
+    }
+    if (Button("##gp_test", GL_BtnMesurer, GL_TxtMesurer, GA_BTN_HALF, GA_BTN_HALF_F, Tr(pm.testing ? STR_PAD_TEST_STOP : STR_PAD_TEST), pm.testing)) {
+        pm.testing = !pm.testing; pm.testStart = now; pm.recording = false;
+    }
+    if (Button("##gp_done", GL_BtnCalibrer, GL_TxtCalibrer, GA_BTN_HALF, GA_BTN_HALF_F, Tr(STR_PAD_DONE))) {
+        if (mc.stepCount == 0) DeleteMacro(pm, pm.editMacro);
+        pm.editMacro = -1; pm.recording = false; pm.testing = false; pm.capTrigger = false;
+        s_lastStep = -1;
+        return;
+    }
+
+    // ======================= right column ================================================
+    DrawStepsGlyph(962.0f, GL_IcoTitreSouris.y - 2.0f);
+    sprintf(buf, Tr(STR_PAD_ED_STEP), pm.editStep + 1);
+    Text(g_fontGTitle, 37.0f, GL_TxtTitreSouris.x, GL_TxtTitreSouris.y, Rgb(0xF2F5F8), cur ? buf : "", AL_L, 240.0f);
+    ImgAt(GA_TITLE_RULE_S, GL_RegleSouris);
+    if (!cur) return;
+    // 17 buttons + pause: tick to hold the button during the step
+    for (int n = 0; n <= PAD_CELLS; n++) {
+        const int c = n % 3, r = n / 3;
+        const float x = 962.0f + 94.0f * c, y = 206.0f + 48.0f * r;
+        sprintf(id, "##gp_tg%d", n);
+        Hit h = HitRect(id, x, y, 88.0f, 46.0f);
+        const bool pause = (n == PAD_CELLS);
+        const bool on = pause ? (cur->mask == 0) : ((cur->mask & (1u << n)) != 0);
+        Cell9((on || h.hot) ? GA_KCELL_F : GA_KCELL, x, y, 88.0f);
+        if (pause) Text(g_fontGBody, 22.0f, x + 44.0f, y + 23.0f, Rgb(on ? kGold : kTxt2), Tr(STR_PAD_PAUSE), AL_M, 80.0f);
+        else BadgeScaled(n, x + 44.0f, y + 23.0f, 0.95f, on ? 255 : 110);
+        if (h.pressed) {
+            if (pause) cur->mask = 0; else cur->mask ^= (1u << n);
+            if (cur->mask == 0 && cur->ms == 0) cur->ms = pm.heldLastMs > 0 ? pm.heldLastMs : 100;   // a pause needs a time
+            pm.testing = false; pm.reqSaveButtons = true;
+        }
+    }
+    // duration: the mouse slider panel, one slider + "while held"
+    const float py = 504.0f;
+    SlidersPanel(956.0f, py, 72.0f, 28.0f);
+    {
+        const bool held = (cur->ms == 0);
+        Text(g_fontGTitle, 30.0f, 966.0f, py + 20.0f, Rgb(0xF2F5F8), Tr(STR_PAD_DURATION), AL_L, 180.0f);
+        if (held) strcpy(buf, Tr(STR_PAD_HELD)); else sprintf(buf, "%d ms", cur->ms);
+        Text(g_fontGBodyM, 22.0f, 1232.0f, py + 22.0f, Rgb(kGold), buf, AL_R);
+        const float tx = 966.0f, tw = 266.0f, ry = py + 44.0f;
+        Hit h = HitRect("##gp_dur", tx - 10.0f, ry - 14.0f, tw + 20.0f, 34.0f);
+        if (h.active) {
+            cur->ms = FracToMs((io.MousePos.x / s_k - tx) / tw);
+            pm.heldLastMs = cur->ms;
+            pm.testing = false;
+        }
+        if (h.deactivated) pm.reqSaveButtons = true;
+        SliderRail(tx, ry, tw, held ? 1.0f : MsToFrac(cur->ms));
+
+        const char* lbl = Tr(STR_PAD_HELD_CHK);
+        const float lw = TextW(g_fontGSmall, 20.0f, lbl), right = 1230.0f, cy = py + 85.0f, bx = right - lw - 24.0f;
+        Hit hi = HitRect("##gp_held", bx - 4.0f, cy - 12.0f, lw + 32.0f, 24.0f);
+        s_dl->AddRect(P(bx, cy - 8.0f), P(bx + 16.0f, cy + 8.0f), Rgb(hi.hot ? kGold : 0x8FA2B8), 3.0f * s_k, ImDrawCornerFlags_All, 1.5f);
+        if (held) s_dl->AddRectFilled(P(bx + 4.0f, cy - 4.0f), P(bx + 12.0f, cy + 4.0f), Rgb(kGold), 2.0f * s_k);
+        Text(g_fontGSmall, 20.0f, right, cy, Rgb(hi.hot ? kGold : kTxt2), lbl, AL_R);
+        if (hi.pressed) {
+            if (held) cur->ms = pm.heldLastMs > 0 ? pm.heldLastMs : 80;
+            else { pm.heldLastMs = cur->ms; cur->ms = 0; }
+            if (cur->mask == 0 && cur->ms == 0) cur->ms = 100;
+            pm.testing = false; pm.reqSaveButtons = true;
+        }
+    }
+    Text(g_fontGSmall, 18.0f, 962.0f, 626.0f, Rgb(kTxt3), Tr(STR_PAD_ED_HINT), AL_L, 276.0f);
+}
+
+void DrawUiGlossyPad(GlossyPadModel& pm, int& activeTab, float screenW, float screenH) {
+    (void)screenH;
+    s_k  = screenW / 1280.0f;
+    s_dl = ImGui::GetWindowDrawList();
+    ImGuiIO& io = ImGui::GetIO();
+    const double now = ImGui::GetTime();
+    char buf[128];
+    static unsigned s_prevMask = 0;
+
+    if (s_menu == 2 && pm.padCount == 0) s_menu = -1;
+    s_blockHits = (s_menu >= 0);
+    HeaderAndTabs(activeTab, false);
+
+    // ---- device bar: the same chips as the keyboard & mouse page ---------------
+    ImgAt(GA_BAR_INFO, GL_BarreInfo);
+    {
+        const GlRect* chip[2] = { &GL_PuceClavier, &GL_PuceSouris };
+        const GlRect* ico[2]  = { &GL_IcoClavier, &GL_IcoSouris };
+        const GlRect* dot[2]  = { &GL_DotClavier, &GL_DotSouris };
+        const GlRect* chev[2] = { &GL_ChevronClavier, &GL_ChevronSouris };
+        const int     icoId[2] = { GA_ICON_KB, GA_ICON_MS };
+        const bool    has[2] = { pm.hasKeyboard, pm.hasMouse };
+        for (int d = 0; d < 2; d++) {
+            sprintf(buf, "##gp_dev%d", d);
+            Hit h = HitAt(buf, *chip[d]);
+            ImgAt(h.hot ? GA_DEV_CHIP_ON : GA_DEV_CHIP, *chip[d]);
+            ImgAt(icoId[d], *ico[d]);
+            ImgAt(has[d] ? GA_DOT_ON : GA_DOT_RED, *dot[d]);
+            ImgAt(GA_CHEVRON, *chev[d]);
+            if (h.pressed) pm.reqBack = d;   // back to the keyboard & mouse page
+        }
+        bool any = false;
+        for (int i = 0; i < pm.padCount; i++) any = any || pm.pads[i].active;
+        if (PadChip(true, any)) s_menu = (s_menu == 2) ? -1 : 2;
+    }
+
+    const unsigned newBits = pm.liveMask & ~s_prevMask;
+    s_prevMask = pm.liveMask;
+    if (pm.editMacro >= 0) PadEditorPage(pm, now, io, newBits);
+    if (pm.editMacro < 0)  PadMainPage(pm, now, io, newBits);
+
+    // ---- footer: version and plugin state ----------------------------------------
+    {
+        sprintf(buf, "v%s", pm.appVersion ? pm.appVersion : "?");
+        float x = GL_TxtVersionBas.x;
+        x += Text(g_fontGBodyM, 24.0f, x, GL_TxtVersionBas.y, Rgb(0xFFFFFF), buf) + 18.0f;
+        Img(pm.pluginAlive ? GA_DOT_ON : GA_DOT_RED, x, GL_DotPlugin.y);
+        Text(g_fontGBody, 24.0f, x + 18.0f, GL_TxtVersionBas.y, Rgb(pm.pluginAlive ? kTxt2 : 0xF08A80),
+             Tr(pm.pluginAlive ? STR_UI_PLUGIN_ALIVE : STR_UI_PLUGIN_SILENT));
+    }
+
+    // ---- pad drop-down, drawn last (on top) ---------------------------------------
+    if (s_menu == 2) {
+        s_blockHits = false;
+        bool refresh = false;
+        const int picked = DeviceMenu(2, pm.pads, pm.padCount, pm.sel, GL_PucePad, refresh);
+        if (picked >= 0) pm.reqOpenPad = picked;
+        if (refresh) pm.reqRefresh = true;
+    }
+    s_blockHits = false;
 }

@@ -27,8 +27,12 @@
 
 // Formats dont on n'a pas l'usage. A reactiver au cas par cas si un jour on
 // embarque autre chose que du PNG.
+// The Windows Studio also reads JPEG and BMP: the player's own picture behind the
+// In-game display preview (windows/src/overlay_page_win.cpp).
+#ifdef _XBOX
 #define STBI_NO_JPEG
 #define STBI_NO_BMP
+#endif
 #define STBI_NO_PSD
 #define STBI_NO_TGA
 #define STBI_NO_GIF

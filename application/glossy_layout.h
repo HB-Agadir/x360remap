@@ -28,6 +28,11 @@ static const GlRect GL_PuceSouris = { 652.0f, 97.0f, 80.0f, 38.0f };
 static const GlRect GL_IcoSouris = { 664.0f, 100.0f, 22.0f, 32.0f };
 static const GlRect GL_DotSouris = { 706.0f, 111.0f, 10.0f, 10.0f };
 static const GlRect GL_ChevronSouris = { 718.0f, 113.0f, 10.0f, 6.0f };
+// USB controller chip (2026-11-05): same chip, one step (104 px) to the right.
+static const GlRect GL_PucePad = { 756.0f, 97.0f, 80.0f, 38.0f };
+static const GlRect GL_IcoPad = { 768.0f, 103.0f, 38.0f, 26.0f };
+static const GlRect GL_DotPad = { 810.0f, 111.0f, 10.0f, 10.0f };
+static const GlRect GL_ChevronPad = { 822.0f, 113.0f, 10.0f, 6.0f };
 static const GlRect GL_LangueEN = { 1040.0f, 104.0f, 36.0f, 24.0f };
 static const GlRect GL_AnneauLangue = { 1085.0f, 101.0f, 36.0f, 24.0f };
 static const GlRect GL_LangueFR = { 1088.0f, 104.0f, 36.0f, 24.0f };

@@ -188,5 +188,6 @@ struct ButtonsReport {
 	uint8_t r1;
 	uint8_t l1;
 	uint8_t xbox;
+	uint16_t macroHeld;   // bit i = the pad button of macro i is held (HidFillButtonsReport)
 };
 #pragma pack(pop)

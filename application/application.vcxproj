@@ -125,6 +125,7 @@
     <ClInclude Include="ui_layout.h" />
     <ClInclude Include="ui_mapping.h" />
     <ClInclude Include="ui_glossy.h" />
+    <ClInclude Include="overlay_preview.h" />
     <ClInclude Include="aurora_library.h" />
     <ClInclude Include="glossy_assets.h" />
     <ClInclude Include="glossy_layout.h" />
@@ -182,6 +183,7 @@
     <ClCompile Include="ui_layout.cpp" />
     <ClCompile Include="ui_mapping.cpp" />
     <ClCompile Include="ui_glossy.cpp" />
+    <ClCompile Include="overlay_preview.cpp" />
     <ClCompile Include="aurora_library.cpp" />
     <ClCompile Include="glossy_assets.cpp" />
     <ClCompile Include="font_data_barlow.cpp" />
@@ -213,6 +215,9 @@
     </ClCompile>
     <ClCompile Include="..\X360Remap\known_titles.cpp">
       <ObjectFileName>$(IntDir)known_titles_app.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="..\X360Remap\camera_learn.cpp">
+      <ObjectFileName>$(IntDir)camera_learn_app.obj</ObjectFileName>
     </ClCompile>
     <ClCompile Include="..\X360Remap\mouse_calibration.cpp">
       <ObjectFileName>$(IntDir)mouse_calibration_app.obj</ObjectFileName>

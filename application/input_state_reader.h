@@ -11,7 +11,7 @@ struct InputStateSnapshot {
     InputStateSnapshot()
         : keyCode(-1), mouseButton(-1), mouseDX(0), mouseDY(0),
           mouseButtonsMask(0), wheelDelta(0), rawLen(0), tick(0), rawSeq(0), hasRawSeq(false), valid(false),
-          hasDevs(false), devCount(0) {
+          hasDevs(false), devCount(0), padBtn(0), hasPadBtn(false) {
         for (int i = 0; i < 16; i++) raw[i] = 0;
         for (int i = 0; i < 4; i++) { devType[i] = 0; devVid[i] = devPid[i] = 0; }
     }
@@ -63,7 +63,13 @@ struct InputStateSnapshot {
     uint16_t devVid[4];
     uint16_t devPid[4];
 
-    uint32_t tick;         // plugin.xex's GetTickCount() at write time
+    // "padBtn" (hex string, bit n = button idx n held on the first USB pad), from
+    // a plugin that writes it; hasPadBtn = false otherwise. 'c' entries in devs
+    // are USB controllers (the plugin lists keyboards 'k', mice 'm', pads 'c').
+    uint32_t padBtn;
+    bool     hasPadBtn;
+
+    uint32_t tick;        // plugin.xex's GetTickCount() at write time
     // Numero du dernier rapport souris recu par le plugin (2026-09-25). Change
     // seulement quand un NOUVEAU rapport arrive, contrairement a tick.
     // hasRawSeq == false : plugin plus ancien, champ absent.

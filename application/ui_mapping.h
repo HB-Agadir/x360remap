@@ -102,6 +102,10 @@ struct UiMappingModel {
     // Peripheriques
     const UiDeviceEntry* keyboards;   int keyboardCount;
     const UiDeviceEntry* mice;        int mouseCount;
+    // USB controllers plugged in ('c' in the plugin's devs list): one pill each
+    // in the device bar; a click sets requestOpenPad = its index (-1 = nothing).
+    const UiDeviceEntry* pads;        int padCount;
+    int   requestOpenPad;
     int   detectedCount;              // pour le bloc d'etat
     bool  pluginAlive;                // le plugin ecrit-il toujours son etat
 

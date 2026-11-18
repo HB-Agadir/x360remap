@@ -92,6 +92,19 @@ bool ApplyKeyboardMappingEntry(uint16_t vid, uint16_t pid, const HidKeyMapEntry&
     if (existing && existing->keyMap) {
         merged.assign(existing->keyMap, existing->keyMap + existing->keyMapCount);
     }
+    // No layout of its own yet: start from the DEFAULT layout (2026-10-11,
+    // tester with a Razer Tartarus). Writing just the one key made the file
+    // hold a single entry, and that single entry was the whole keyboard.
+    if (merged.empty()) {
+        HidKeyMapEntry defs[64];
+        const uint8_t nd = GetDefaultKeyMap(defs, 64);
+        merged.assign(defs, defs + nd);
+    }
+    // The key now used for this action loses whatever it did before.
+    for (std::vector<HidKeyMapEntry>::iterator it = merged.begin(); it != merged.end(); ) {
+        if (it->code == entry.code && it->action != entry.action) it = merged.erase(it);
+        else ++it;
+    }
 
     // Remplace par ACTION (le bouton manette), pas par code clavier : c'est
     // "quelle touche fait Y desormais" qu'on reassigne, pas "que fait cette
@@ -221,6 +234,120 @@ bool ApplyMouseButtonMapping(uint16_t vid, uint16_t pid, const std::vector<Mouse
 
     g_dynamicData.push_back(std::move(data));
 
+    return SaveMappingsToFile(configPath);
+}
+
+const char* const kPadFieldNames[PAD_CELLS] = {
+    "a_button", "b_button", "x_button", "y_button", "l1", "r1", "l2", "r2", "l3", "r3",
+    "start", "back", "xbox", "dpad_up", "dpad_down", "dpad_left", "dpad_right"
+};
+
+static HidDeviceMapping* FindDynamicMapping(uint16_t vid, uint16_t pid) {
+    for (std::vector<HidDeviceMapping>::iterator it = g_dynamicMappings.begin(); it != g_dynamicMappings.end(); ++it)
+        if (it->vendorId == vid && it->productId == pid) return &(*it);
+    return nullptr;
+}
+
+typedef char PadStepsMatchPlugin[(PAD_STEPS_MAX_CFG == MAX_MACRO_STEPS && PAD_MACROS_MAX_CFG == MAX_MACROS) ? 1 : -1];
+
+static uint32_t PadCellBit(int cell) { return MacroFieldBit(GetButtonFieldPtr(kPadFieldNames[cell])); }
+
+bool ReadPadConfig(uint16_t vid, uint16_t pid, PadConfig& out) {
+    return ReadPadConfig(vid, pid, out, kDefaultConfigPath);
+}
+
+bool ReadPadConfig(uint16_t vid, uint16_t pid, PadConfig& out, const char* configPath) {
+    out.hasEntry = out.hasAxes = out.invertRY = false;
+    out.deadzone = 0;
+    out.macroCount = 0;
+    for (int i = 0; i < PAD_CELLS; i++) out.btnIdx[i] = -1;
+    LoadMappingsFromFile(configPath);
+    HidDeviceMapping* m = FindDynamicMapping(vid, pid);
+    if (!m) return false;
+    out.hasEntry = true;
+    out.hasAxes = m->axisMapCount > 0;
+    out.invertRY = m->invert.invertRY;
+    out.deadzone = m->deadzone;
+    for (uint8_t b = 0; b < m->buttonMapCount; b++) {
+        const char* name = GetButtonFieldName(m->buttonMap[b].field);
+        for (int i = 0; i < PAD_CELLS; i++)
+            if (name && strcmp(name, kPadFieldNames[i]) == 0 && out.btnIdx[i] < 0)
+                out.btnIdx[i] = m->buttonMap[b].idx;
+    }
+    for (uint8_t k = 0; k < m->macroCount && out.macroCount < PAD_MACROS_MAX_CFG; k++) {
+        const HidButtonMacro& mc = m->macros[k];
+        PadMacro& pm = out.macros[out.macroCount];
+        pm.btn = mc.idx; pm.stepCount = 0;
+        for (int s = 0; s < mc.stepCount && pm.stepCount < PAD_STEPS_MAX_CFG; s++) {
+            PadStep& st = pm.steps[pm.stepCount];
+            st.mask = 0;
+            for (int i = 0; i < PAD_CELLS; i++) if (PadCellBit(i) & mc.steps[s].mask) st.mask |= 1u << i;
+            st.ms = mc.steps[s].ms;
+            pm.stepCount++;
+        }
+        if (pm.stepCount > 0) out.macroCount++;
+    }
+    return true;
+}
+
+bool ApplyPadButtons(uint16_t vid, uint16_t pid, const int btnIdx[PAD_CELLS], const PadMacro* macros, int macroCount) {
+    return ApplyPadButtons(vid, pid, btnIdx, macros, macroCount, kDefaultConfigPath);
+}
+
+bool ApplyPadButtons(uint16_t vid, uint16_t pid, const int btnIdx[PAD_CELLS], const PadMacro* macros, int macroCount, const char* configPath) {
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
+    HidDeviceMapping* m = FindDynamicMapping(vid, pid);
+    if (!m || m->axisMapCount == 0)
+        return false;   // see config_writer.h: no entry / no axes = do not touch
+
+    std::unique_ptr<DynamicMappingData> data(new DynamicMappingData());
+    if (macroCount > PAD_MACROS_MAX_CFG) macroCount = PAD_MACROS_MAX_CFG;
+    for (int k = 0; k < macroCount && data->macroEntries.size() < MAX_MACROS; k++) {
+        if (macros[k].btn < 0 || macros[k].btn > 31) continue;
+        HidButtonMacro mc = {};
+        mc.idx = (uint8_t)macros[k].btn;
+        for (int s = 0; s < macros[k].stepCount && mc.stepCount < MAX_MACRO_STEPS; s++) {
+            const PadStep& in = macros[k].steps[s];
+            HidMacroStep st;
+            st.mask = 0;
+            for (int i = 0; i < PAD_CELLS; i++) if (in.mask & (1u << i)) st.mask |= PadCellBit(i);
+            st.ms = (uint16_t)(in.ms <= 0 ? 0 : in.ms < 16 ? 16 : in.ms > 5000 ? 5000 : in.ms);
+            if (st.mask == 0 && st.ms == 0) continue;   // a pause needs a duration
+            mc.steps[mc.stepCount++] = st;
+        }
+        if (mc.stepCount > 0) data->macroEntries.push_back(mc);
+    }
+    for (int i = 0; i < PAD_CELLS; i++) {
+        if (btnIdx[i] < 0 || btnIdx[i] > 31) continue;
+        bool isMacro = false;   // a macro button is not also a plain button
+        for (size_t k = 0; k < data->macroEntries.size(); k++) isMacro = isMacro || data->macroEntries[k].idx == btnIdx[i];
+        if (isMacro) continue;
+        HidButtonMapEntry e;
+        e.idx = (uint8_t)btnIdx[i];
+        e.field = GetButtonFieldPtr(kPadFieldNames[i]);
+        if (e.field) data->buttonEntries.push_back(e);
+    }
+    m->buttonMap = data->buttonEntries.data();
+    m->buttonMapCount = static_cast<uint8_t>(data->buttonEntries.size());
+    m->macros = data->macroEntries.data();
+    m->macroCount = static_cast<uint8_t>(data->macroEntries.size());
+    g_dynamicData.push_back(std::move(data));
+    return SaveMappingsToFile(configPath);
+}
+
+bool ApplyPadStick(uint16_t vid, uint16_t pid, bool invertRY, int deadzone) {
+    return ApplyPadStick(vid, pid, invertRY, deadzone, kDefaultConfigPath);
+}
+
+bool ApplyPadStick(uint16_t vid, uint16_t pid, bool invertRY, int deadzone, const char* configPath) {
+    if (!LoadMappingsForUpdate(configPath))
+        return false;
+    HidDeviceMapping* m = FindDynamicMapping(vid, pid);
+    if (!m || m->axisMapCount == 0)
+        return false;
+    m->invert.invertRY = invertRY;
+    m->deadzone = deadzone < 0 ? 0 : (deadzone > 32767 ? 32767 : deadzone);
     return SaveMappingsToFile(configPath);
 }
 
@@ -496,6 +623,7 @@ std::vector<KnownDeviceInfo> ListKnownDevices(const char* knownDevicesPath) {
         info.vid = it->vid;
         info.pid = it->pid;
         info.isMouse = it->isMouse;
+        info.isPad = it->isPad;
         size_t n = 0;
         for (; n < sizeof(info.name) - 1 && it->name[n] != '\0'; n++)
             info.name[n] = it->name[n];

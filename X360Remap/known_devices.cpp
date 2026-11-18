@@ -49,13 +49,14 @@ std::vector<KnownDeviceEntry> ParseKnownDevices(const std::string& content) {
         if (pidStr.empty() || endPtr != pidStr.c_str() + pidStr.size())
             continue;
 
-        if (typeStr != "M" && typeStr != "K")
+        if (typeStr != "M" && typeStr != "K" && typeStr != "C")
             continue;
 
         KnownDeviceEntry entry;
         entry.vid = static_cast<uint16_t>(vid);
         entry.pid = static_cast<uint16_t>(pid);
         entry.isMouse = (typeStr == "M");
+        entry.isPad = (typeStr == "C");
         size_t n = nameStr.size();
         if (n > sizeof(entry.name) - 1)
             n = sizeof(entry.name) - 1;
@@ -72,7 +73,7 @@ std::string SerializeKnownDevices(const std::vector<KnownDeviceEntry>& devices) 
     std::string out;
     char buf[24];
     for (std::vector<KnownDeviceEntry>::const_iterator it = devices.begin(); it != devices.end(); ++it) {
-        std::sprintf(buf, "%04X:%04X:%s", (unsigned int)it->vid, (unsigned int)it->pid, it->isMouse ? "M" : "K");
+        std::sprintf(buf, "%04X:%04X:%s", (unsigned int)it->vid, (unsigned int)it->pid, it->isPad ? "C" : it->isMouse ? "M" : "K");
         out += buf;
         if (it->name[0] != '\0') {
             out += ':';
@@ -93,12 +94,15 @@ bool AddKnownDevice(std::vector<KnownDeviceEntry>* devices, uint16_t vid, uint16
 }
 
 bool AddKnownDevice(std::vector<KnownDeviceEntry>* devices, uint16_t vid, uint16_t pid,
-                    bool isMouse, const char* name) {
+                    bool isMouse, const char* name, bool isPad) {
     if (!devices)
         return false;
 
     for (std::vector<KnownDeviceEntry>::iterator it = devices->begin(); it != devices->end(); ++it) {
-        if (it->vid == vid && it->pid == pid) {
+        // Key = vid + pid + TYPE (2026-10-29): a combo receiver (Rapoo
+        // 24AE:2015) is ONE VID:PID with a keyboard AND a mouse interface; with
+        // vid+pid only, the mouse was never listed and stayed red in the Studio.
+        if (it->vid == vid && it->pid == pid && it->isMouse == isMouse && it->isPad == isPad) {
             // Deja connu, mais on complete son nom si on vient tout juste de
             // l'apprendre : un fichier ecrit par une version anterieure du
             // plugin n'en contient pas, et il serait absurde de continuer a
@@ -118,6 +122,7 @@ bool AddKnownDevice(std::vector<KnownDeviceEntry>* devices, uint16_t vid, uint16
     entry.vid = vid;
     entry.pid = pid;
     entry.isMouse = isMouse;
+    entry.isPad = isPad;
     entry.name[0] = '\0';
     if (name) {
         size_t k = 0;

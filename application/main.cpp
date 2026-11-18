@@ -42,8 +42,11 @@
 #include "image_data_qrcode.h"
 #include "ui_mapping.h" // ECRAN PARTAGE avec la previsualisation - voir preview/LISEZ-MOI.md
 #include "ui_glossy.h"     // page Clavier & souris "glossy" (2026-09-24)
+#include "overlay_preview.h"   // apercu de l'affichage en jeu (page Affichage en jeu)
 #include "glossy_assets.h" // ses textures PNG embarquees
 #include "aurora_library.h" // noms exacts + pochettes des jeux (page Profils de jeux)
+#include "plugin_diag.h"    // plugin not running: cause read from launch.ini
+#include "camera_file.h"
 #include <algorithm>
 
 // XexUtils - vendorise dans XexUtils/ (voir
@@ -79,6 +82,7 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <iterator>
 #include <cmath> // cosf/sinf - etoile du drapeau marocain, page Soutenir (2026-08-17)
 #include <cstdarg>
 #include <cstdlib> // strtoul - saisie du titleId hexadecimal, onglet Profils (Jalon 7)
@@ -114,6 +118,20 @@ static void AppLog(const char* fmt, ...) {
     std::ios_base::openmode mode = std::ios::binary;
     mode |= g_appLogTruncatedThisRun ? std::ios::app : std::ios::trunc;
 
+    // Keep the previous run (2026-10-11): a Studio that froze is only left by
+    // powering off, and opening it again used to erase that run's log.
+    if (!g_appLogTruncatedThisRun) {
+        std::ifstream old("HDD:\\X360RemapStudio\\X360Remap_studio.log", std::ios::binary);
+        if (old.is_open()) {
+            std::string content((std::istreambuf_iterator<char>(old)), std::istreambuf_iterator<char>());
+            old.close();
+            if (content.size() > 256 * 1024) content.erase(0, content.size() - 256 * 1024);
+            std::ofstream prev("HDD:\\X360RemapStudio\\X360Remap_studio_previous.log",
+                               std::ios::binary | std::ios::trunc);
+            if (prev.is_open()) prev.write(content.data(), (std::streamsize)content.size());
+        }
+    }
+
     std::ofstream f("HDD:\\X360RemapStudio\\X360Remap_studio.log", mode);
     if (f.is_open()) {
         f << "[" << GetTickCount() << "ms] " << buf << "\r\n";
@@ -139,6 +157,7 @@ static void AppLog(const char* fmt, ...) {
 enum AppTab {
     TAB_MAPPING = 0,   // clavier + souris reunis, avec bascule (idee HB)
     TAB_PROFILES,
+    TAB_OVERLAY,       // in-game display (overlay_settings.txt), 2026-11-01
     TAB_HOWTO,
     TAB_SUPPORT,
 };
@@ -183,6 +202,11 @@ static IDirect3DTexture9* g_texQrKofi = nullptr;
 static int g_texQrKofiW = 0, g_texQrKofiH = 0;
 
 static AppTab g_activeTab = TAB_MAPPING;
+static bool g_overlayCapturing = false;   // overlay page waits for the shortcut key
+// Plugin seen alive by the 5 s check (status file / log / input) - see the
+// "Plugin not running" band. Used for "Plugin active" too, so a plugin with
+// no keyboard or mouse plugged in is not shown as silent.
+static bool g_pluginAliveCheck = false;
 // Device D3D, pour charger les pochettes a la demande depuis la page Profils.
 static IDirect3DDevice9* g_device = nullptr;
 
@@ -678,6 +702,8 @@ static bool ProfileComboGetter(void*, int idx, const char** out_text) {
 // grille correspondant a l'etape courante surlignee en direct. Logique de
 // session deja testee par ailleurs (application/tests/test_wizard_session.cpp)
 // - aucune decision n'est prise ici, seulement de la lecture + mise en forme.
+static bool g_capture1JustStarted = false;   // wizard (see "Release first" below)
+static bool g_capture2JustStarted = false;   // single-key binding
 static void UpdateWizardModel(UiMappingModel& m) {
     if (!g_wizard) {
         m.wizardActive = false;
@@ -686,6 +712,16 @@ static void UpdateWizardModel(UiMappingModel& m) {
 
     const InputStateSnapshot& snap = g_lastSnapshot;
     int32_t code = snap.valid ? snap.keyCode : MappingAssistant::NO_CODE;
+    // Release first (2026-10-12, Tartarus tester: "when I press 20/Space/A on
+    // a cell to bind it, it just binds it to 20/Space/A"). The key that
+    // started the capture is often still held: ignore everything until no
+    // key is held, THEN capture the next press.
+    static bool s_armed1 = false;
+    if (g_capture1JustStarted) { g_capture1JustStarted = false; s_armed1 = false; }
+    if (!s_armed1) {
+        if (code == MappingAssistant::NO_CODE) s_armed1 = true;
+        code = MappingAssistant::NO_CODE;
+    }
 
     // Annulation sur ECHAP physique, pas BACK (2026-08-17, bug reel signale
     // par HB) : BACK annulait via UpdateGamepadNavigation() en lisant l'etat
@@ -784,6 +820,16 @@ static void UpdateManualAssignModel(UiMappingModel& m) {
 
     const InputStateSnapshot& snap = g_lastSnapshot;
     int32_t code = snap.valid ? snap.keyCode : MappingAssistant::NO_CODE;
+    // Release first (2026-10-12, Tartarus tester: "when I press 20/Space/A on
+    // a cell to bind it, it just binds it to 20/Space/A"). The key that
+    // started the capture is often still held: ignore everything until no
+    // key is held, THEN capture the next press.
+    static bool s_armed2 = false;
+    if (g_capture2JustStarted) { g_capture2JustStarted = false; s_armed2 = false; }
+    if (!s_armed2) {
+        if (code == MappingAssistant::NO_CODE) s_armed2 = true;
+        code = MappingAssistant::NO_CODE;
+    }
 
     // Meme raison d'etre que dans UpdateWizardModel : ECHAP physique, pas
     // BACK, pour ne pas annuler la capture en appuyant sur la touche deja
@@ -1341,22 +1387,82 @@ static void UpdateGamepadNavigation(ImGuiIO& io) {
     // besoin de detecter explicitement l'absence de manette pour ce cas.
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 
-    const WORD b = pad->wButtons;
+    // ANY controller drives the Studio (2026-10-11, tester report: his real
+    // controller was player 2, the keypad's keys were not seen, so nothing
+    // answered and the Studio looked frozen - only a power-off got him out).
+    // Slot 0 keeps going through GetInput (unchanged); slots 1-3 are read
+    // directly with XInputGetState, so a pad unplugged from them cannot
+    // leave a stale button held (GetInput keeps its last state).
+    WORD b = pad->wButtons;
+    float lx = pad->ThumbLeftX, ly = pad->ThumbLeftY;
+    // First button seen on each slot goes to the log (tester: "only the
+    // thumbpad works" - this tells which slot and which buttons reach us).
+    static WORD s_seen[XUSER_MAX_COUNT] = { 0 };
+    if (b & ~s_seen[0]) {
+        AppLog("Studio input: slot 0 buttons %04X", (unsigned)b);
+        s_seen[0] |= b;
+    }
+    for (DWORD u = 1; u < XUSER_MAX_COUNT; u++) {
+        XINPUT_STATE st;
+        memset(&st, 0, sizeof(st));
+        if (XInputGetState(u, &st) != ERROR_SUCCESS) continue;
+        if (st.Gamepad.wButtons & ~s_seen[u]) {
+            AppLog("Studio input: slot %u buttons %04X", (unsigned)u, (unsigned)st.Gamepad.wButtons);
+            s_seen[u] |= st.Gamepad.wButtons;
+        }
+        b |= st.Gamepad.wButtons;
+        const float dz = 7849.0f;
+        const float sx = st.Gamepad.sThumbLX, sy = st.Gamepad.sThumbLY;
+        const float nx = sx > dz ? (sx - dz) / (32767.0f - dz) : (sx < -dz ? (sx + dz) / (32767.0f - dz) : 0.0f);
+        const float ny = sy > dz ? (sy - dz) / (32767.0f - dz) : (sy < -dz ? (sy + dz) / (32767.0f - dz) : 0.0f);
+        if (fabsf(nx) > fabsf(lx)) lx = nx;
+        if (fabsf(ny) > fabsf(ly)) ly = ny;
+    }
+
+    // Left stick also moves the focus like the D-pad (2026-10-12): in this
+    // ImGui version the stick only scrolls, so a keyboard / keypad player
+    // pressing WASD (= left stick) could not move around the Studio - only
+    // the arrows (= D-pad) worked, exactly what the Tartarus tester saw.
+    if (lx < -0.5f) b |= XINPUT_GAMEPAD_DPAD_LEFT;
+    if (lx >  0.5f) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+    if (ly >  0.5f) b |= XINPUT_GAMEPAD_DPAD_UP;
+    if (ly < -0.5f) b |= XINPUT_GAMEPAD_DPAD_DOWN;
+
     io.NavInputs[ImGuiNavInput_Activate]  = (b & XINPUT_GAMEPAD_A) ? 1.0f : 0.0f;
     io.NavInputs[ImGuiNavInput_Cancel]    = (b & XINPUT_GAMEPAD_B) ? 1.0f : 0.0f;
     io.NavInputs[ImGuiNavInput_DpadUp]    = (b & XINPUT_GAMEPAD_DPAD_UP) ? 1.0f : 0.0f;
     io.NavInputs[ImGuiNavInput_DpadDown]  = (b & XINPUT_GAMEPAD_DPAD_DOWN) ? 1.0f : 0.0f;
     io.NavInputs[ImGuiNavInput_DpadLeft]  = (b & XINPUT_GAMEPAD_DPAD_LEFT) ? 1.0f : 0.0f;
     io.NavInputs[ImGuiNavInput_DpadRight] = (b & XINPUT_GAMEPAD_DPAD_RIGHT) ? 1.0f : 0.0f;
-    io.NavInputs[ImGuiNavInput_FocusPrev] = (b & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 1.0f : 0.0f;
-    io.NavInputs[ImGuiNavInput_FocusNext] = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 1.0f : 0.0f;
+    // LB / RB = previous / next page (2026-10-23, asked by HB: the pad could
+    // move inside a page but never reach the next one). One press = one
+    // page, wraps around; not while the wizard or the calibration runs.
+    {
+        static WORD s_prevShoulders = 0;
+        const WORD sh = b & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER);
+        const WORD pressed = sh & ~s_prevShoulders;
+        s_prevShoulders = sh;
+        if (!g_wizard && !g_calib && pressed) {
+            const int count = (int)TAB_SUPPORT + 1;
+            int t = (int)g_activeTab;
+            if (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) t = (t + 1) % count;
+            if (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER)  t = (t + count - 1) % count;
+            if (t != (int)g_activeTab) {
+                g_activeTab = (AppTab)t;
+                AppLog("Studio: page %d (LB / RB)", t);
+            }
+        }
+    }
+    // LB / RB no longer go to ImGui's focus-next / prev (they switch pages).
+    io.NavInputs[ImGuiNavInput_FocusPrev] = 0.0f;
+    io.NavInputs[ImGuiNavInput_FocusNext] = 0.0f;
 
     // Deja normalise et deadzone par GetInput() - simple clamp au signe pour
     // ImGui (qui attend une magnitude positive par direction).
-    io.NavInputs[ImGuiNavInput_LStickLeft]  = (pad->ThumbLeftX < 0.0f) ? -pad->ThumbLeftX : 0.0f;
-    io.NavInputs[ImGuiNavInput_LStickRight] = (pad->ThumbLeftX > 0.0f) ?  pad->ThumbLeftX : 0.0f;
-    io.NavInputs[ImGuiNavInput_LStickUp]    = (pad->ThumbLeftY > 0.0f) ?  pad->ThumbLeftY : 0.0f;
-    io.NavInputs[ImGuiNavInput_LStickDown]  = (pad->ThumbLeftY < 0.0f) ? -pad->ThumbLeftY : 0.0f;
+    io.NavInputs[ImGuiNavInput_LStickLeft]  = (lx < 0.0f) ? -lx : 0.0f;
+    io.NavInputs[ImGuiNavInput_LStickRight] = (lx > 0.0f) ?  lx : 0.0f;
+    io.NavInputs[ImGuiNavInput_LStickUp]    = (ly > 0.0f) ?  ly : 0.0f;
+    io.NavInputs[ImGuiNavInput_LStickDown]  = (ly < 0.0f) ? -ly : 0.0f;
 
     // L'annulation du wizard sur BACK a ete retiree d'ici le 2026-08-17 (voir
     // le commentaire dans UpdateWizardModel, remplacee par ECHAP) : BACK lu ici
@@ -1455,15 +1561,29 @@ static std::vector<int> g_mouseDeviceIndices;
 static int g_keyboardComboIdx = 0;
 static int g_mouseComboIdx = 0;
 
-static void RefreshKnownDevices() {
-    g_knownDevices = ListKnownDevices();
+// A pad is never a keyboard or a mouse: type C lines are skipped, and so are old K
+// lines whose VID:PID the plugin now reports as a pad ('c:' in devs).
+static bool IsPadInDevs(uint16_t vid, uint16_t pid) {
+    if (!g_lastSnapshot.valid || !g_lastSnapshot.hasDevs) return false;
+    for (int i = 0; i < g_lastSnapshot.devCount; i++)
+        if (g_lastSnapshot.devType[i] == 'c' && g_lastSnapshot.devVid[i] == vid && g_lastSnapshot.devPid[i] == pid) return true;
+    return false;
+}
+
+static void RebuildDeviceIndices() {
     g_keyboardDeviceIndices.clear();
     g_mouseDeviceIndices.clear();
     for (size_t i = 0; i < g_knownDevices.size(); i++) {
         const KnownDeviceInfo& d = g_knownDevices[i];
-        if (!d.isMouse) g_keyboardDeviceIndices.push_back((int)i);
+        if (d.isPad) continue;
         if (d.isMouse) g_mouseDeviceIndices.push_back((int)i);
+        else if (!IsPadInDevs(d.vid, d.pid)) g_keyboardDeviceIndices.push_back((int)i);
     }
+}
+
+static void RefreshKnownDevices() {
+    g_knownDevices = ListKnownDevices();
+    RebuildDeviceIndices();
 }
 
 static void LoadDevicesOnce() {
@@ -1833,7 +1953,7 @@ static void DrawHowItWorksTab() {
 // Version affichee sur la page Soutenir. A incrementer a chaque release
 // publiee - c'est aussi ce que l'utilisateur lira pour savoir s'il doit
 // mettre a jour.
-static const char* kAppVersion = "1.2.0";
+static const char* kAppVersion = "1.4.1-pre";
 
 // Une "carte" de la page Soutenir : titre d'intention, sous-titre, et la
 // valeur concrete (email/URL) protegee par son hash. Voir DrawSupportTab
@@ -2505,6 +2625,64 @@ static bool IsDevicePlugged(char type, uint16_t vid, uint16_t pid, uint16_t selV
     return false;
 }
 
+static void KeepPluggedOnly(std::vector<int>& indices, char type, uint16_t selVid, uint16_t selPid) {
+    std::vector<int> plugged;
+    for (size_t i = 0; i < indices.size(); i++)
+        if (IsDevicePlugged(type, g_knownDevices[indices[i]].vid, g_knownDevices[indices[i]].pid, selVid, selPid))
+            plugged.push_back(indices[i]);
+    if (!plugged.empty()) indices.swap(plugged);
+}
+
+// USB controllers ('c' in the plugin's devs list, 2026-11-03): one pill each in
+// the device bar, and a page of their own (DrawPadGlossy). g_padView = the
+// controller shown (index in the pad list), -1 = the keyboard & mouse page.
+static int      g_padView = -1;
+static int      s_padCount = 0;
+static uint16_t s_padVid[4], s_padPid[4];
+static char     s_padIdText[4][12];
+static char     s_padName[4][48];
+static UiDeviceEntry s_padEntries[4];
+
+static void CollectPads() {
+    s_padCount = 0;
+    if (g_lastSnapshot.valid && g_lastSnapshot.hasDevs) {
+        for (int i = 0; i < g_lastSnapshot.devCount && s_padCount < 4; i++) {
+            if (g_lastSnapshot.devType[i] != 'c') continue;
+            const int n = s_padCount++;
+            s_padVid[n] = g_lastSnapshot.devVid[i];
+            s_padPid[n] = g_lastSnapshot.devPid[i];
+            sprintf(s_padIdText[n], "%04X:%04X", s_padVid[n], s_padPid[n]);
+            // name from known_devices.txt (type C); none known = "USB controller"
+            const char* nm = Tr(STR_PAD_USB);
+            for (size_t k = 0; k < g_knownDevices.size(); k++)
+                if (g_knownDevices[k].isPad && g_knownDevices[k].vid == s_padVid[n] && g_knownDevices[k].pid == s_padPid[n] && g_knownDevices[k].name[0]) {
+                    nm = g_knownDevices[k].name;
+                    break;
+                }
+            _snprintf(s_padName[n], sizeof(s_padName[n]) - 1, "%s", nm);
+            s_padName[n][sizeof(s_padName[n]) - 1] = '\0';
+            s_padEntries[n].name = s_padName[n];
+            s_padEntries[n].id = s_padIdText[n];
+            s_padEntries[n].active = true;
+        }
+    }
+    // Same name twice (two identical pads): number them in devs order.
+    int rankOf[4], sameOf[4];
+    for (int a = 0; a < s_padCount; a++) {
+        rankOf[a] = sameOf[a] = 0;
+        for (int b = 0; b < s_padCount; b++)
+            if (!strcmp(s_padName[a], s_padName[b])) { sameOf[a]++; if (b < a) rankOf[a]++; }
+    }
+    for (int a = 0; a < s_padCount; a++) {
+        if (sameOf[a] < 2) continue;
+        char tmp[48];
+        _snprintf(tmp, sizeof(tmp) - 1, "%.40s %d", s_padName[a], rankOf[a] + 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+        strcpy(s_padName[a], tmp);
+    }
+    if (g_padView >= s_padCount) g_padView = -1;   // unplugged: back to the main page
+}
+
 // ============================================================================
 // PAGE PROFILS DE JEUX glossy (2026-09-25) : bibliotheque Aurora + profils
 // ============================================================================
@@ -2527,6 +2705,10 @@ static uint32_t    g_bigTid = 0;
 
 static bool FileExistsA(const char* path) {
     return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool PdFileExists(const std::string& path) {   // for DiagnoseLaunchIni
+    return FileExistsA(path.c_str());
 }
 
 static bool ReadWholeFile(const std::string& path, std::vector<unsigned char>& out) {
@@ -2681,6 +2863,139 @@ static IDirect3DTexture9* LoadCover(const std::string& path, int maxW, int maxH,
     return tex;
 }
 
+// USB controller page (2026-11-03): reads / saves the pad's entry in X360Remap.json.
+static void DrawPadGlossy(int& activeTab, float screenW, float screenH) {
+    static GlossyPadModel pm;
+    static int s_loadedFor = -2;
+    static double s_saveButtonsAt = -1.0, s_saveStickAt = -1.0;
+    const double now = ImGui::GetTime();
+    CollectPads();
+    if (g_padView < 0) return;   // the pad went away this frame; the main page draws next frame
+
+    // The plugin writes a built-in pad's entry within ~2 s of the Studio starting:
+    // until it exists, re-read every second (a save before that would drop it).
+    static double s_lastLoad = 0.0;
+    if (s_loadedFor != g_padView || (!(pm.hasEntry && pm.hasAxes) && now - s_lastLoad > 1.0)) {
+        static PadConfig pc;   // 8 KB: not on the stack
+        ReadPadConfig(s_padVid[g_padView], s_padPid[g_padView], pc);
+        pm.hasEntry = pc.hasEntry; pm.hasAxes = pc.hasAxes;
+        for (int i = 0; i < PAD_CELLS; i++) pm.btnIdx[i] = pc.btnIdx[i];
+        pm.invertRY = pc.invertRY;
+        pm.deadzone = pc.deadzone > 10000 ? 10000 : pc.deadzone;
+        pm.macroCount = pc.macroCount;
+        for (int i = 0; i < pc.macroCount; i++) {
+            pm.macros[i].btn = pc.macros[i].btn;
+            pm.macros[i].stepCount = pc.macros[i].stepCount;
+            for (int s = 0; s < pc.macros[i].stepCount; s++) { pm.macros[i].steps[s].mask = pc.macros[i].steps[s].mask; pm.macros[i].steps[s].ms = pc.macros[i].steps[s].ms; }
+        }
+        pm.captureCell = -1; pm.wizard = false;
+        if (s_loadedFor != g_padView) { pm.editMacro = -1; pm.recording = pm.testing = pm.capTrigger = false; }
+        s_loadedFor = g_padView;
+        s_lastLoad = now;
+    }
+    pm.pads = s_padEntries; pm.padCount = s_padCount; pm.sel = g_padView;
+    pm.hasKeyboard = pm.hasMouse = true;   // both pills lead back to the main page
+    pm.pluginAlive = g_lastSnapshot.valid || g_pluginAliveCheck;
+    pm.appVersion = kAppVersion;
+    pm.hasLive = g_lastSnapshot.hasPadBtn;
+    pm.liveMask = g_lastSnapshot.hasPadBtn ? g_lastSnapshot.padBtn : 0;
+
+    DrawUiGlossyPad(pm, activeTab, screenW, screenH);
+
+    // Saves are grouped 1 s after the last change (one write per burst).
+    if (pm.reqSaveButtons) { pm.reqSaveButtons = false; s_saveButtonsAt = now; }
+    if (pm.reqSaveStick)   { pm.reqSaveStick = false;   s_saveStickAt = now; }
+    if (s_saveButtonsAt > 0.0 && now - s_saveButtonsAt > 1.0) {
+        s_saveButtonsAt = -1.0;
+        static PadMacro macros[PAD_MACROS_MAX_CFG];
+        for (int i = 0; i < pm.macroCount; i++) {
+            macros[i].btn = pm.macros[i].btn;
+            macros[i].stepCount = pm.macros[i].stepCount;
+            for (int s = 0; s < pm.macros[i].stepCount; s++) { macros[i].steps[s].mask = pm.macros[i].steps[s].mask; macros[i].steps[s].ms = pm.macros[i].steps[s].ms; }
+        }
+        const bool ok = ApplyPadButtons(s_padVid[g_padView], s_padPid[g_padView], pm.btnIdx, macros, pm.macroCount);
+        AppLog("Studio: pad %04X:%04X buttons %s", s_padVid[g_padView], s_padPid[g_padView], ok ? "saved" : "NOT saved");
+        XexUtils::Xam::XNotify(ok ? "Manette enregistree" : "ECHEC - manette non enregistree");
+    }
+    if (s_saveStickAt > 0.0 && now - s_saveStickAt > 1.0) {
+        s_saveStickAt = -1.0;
+        const bool ok = ApplyPadStick(s_padVid[g_padView], s_padPid[g_padView], pm.invertRY, pm.deadzone);
+        AppLog("Studio: pad %04X:%04X stick %s", s_padVid[g_padView], s_padPid[g_padView], ok ? "saved" : "NOT saved");
+        XexUtils::Xam::XNotify(ok ? "Manette enregistree" : "ECHEC - manette non enregistree");
+    }
+    if (pm.reqOpenPad >= 0) { g_padView = pm.reqOpenPad; pm.reqOpenPad = -1; }
+    if (pm.reqRefresh) { pm.reqRefresh = false; RefreshKnownDevices(); }
+    if (pm.reqBack >= 0) {
+        g_mappingMode = pm.reqBack == 1 ? MAPPING_MOUSE : MAPPING_KEYBOARD;
+        pm.reqBack = -1;
+        g_padView = -1;
+        s_loadedFor = -2;
+    }
+}
+
+// Preview texture of the in-game drawing: re-drawn only when the look changes.
+static IDirect3DTexture9* s_ovTex = nullptr;
+static OverlaySettings s_ovShown;
+static bool s_ovShownOk = false;
+
+static uint32_t PackPreviewTexel(unsigned r, unsigned g, unsigned b, unsigned a) { return IM_COL32(r, g, b, a); }
+
+static void RefreshOverlayPreview(const OverlaySettings& s) {
+    if (!g_device || (s_ovShownOk && OverlaySameLook(s_ovShown, s))) return;
+    if (!s_ovTex && g_device->CreateTexture(OVPV_W, OVPV_H, 1, D3DUSAGE_CPU_CACHED_MEMORY,
+                                            D3DFMT_LIN_A8R8G8B8, D3DPOOL_DEFAULT, &s_ovTex, NULL) < 0) {
+        s_ovTex = nullptr;
+        return;
+    }
+    D3DLOCKED_RECT rect;
+    if (!s_ovTex || s_ovTex->LockRect(0, &rect, NULL, 0) != D3D_OK) return;
+    OverlayPreviewRender(s, (uint8_t*)rect.pBits, (int)rect.Pitch, PackPreviewTexel);
+    s_ovTex->UnlockRect(0);
+    s_ovShown = s;
+    s_ovShownOk = true;
+}
+
+// In-game display page (2026-11-01): edits HDD:\X360RemapStudio\overlay_settings.txt.
+static void DrawOverlayGlossy(int& activeTab, float screenW, float screenH) {
+    static const char* kPath = "HDD:\\X360RemapStudio\\overlay_settings.txt";
+    static OverlaySettings s_set;
+    static GlossyOverlayModel om;
+    static bool s_loaded = false;
+    static int s_prevKey = -1;
+    if (!s_loaded) {
+        OverlayLoad(kPath, s_set);
+        om.s = &s_set;
+        s_loaded = true;
+        // Optional game capture for the preview (a PNG, 16:9); without it the page draws a plain scene.
+        static IDirect3DTexture9* s_prev = nullptr;
+        int pw = 0, ph = 0;
+        if (g_device && LoadTextureFromFile(g_device, "HDD:\\X360RemapStudio\\overlay_preview.png", &s_prev, &pw, &ph))
+            om.previewTex = (ImTextureID)s_prev;
+    }
+    RefreshOverlayPreview(s_set);
+    om.overlayTex = s_ovTex ? (ImTextureID)s_ovTex : 0;
+    const int key = g_lastSnapshot.valid ? g_lastSnapshot.keyCode : -1;
+    om.keyEvent = (key > 0 && key != s_prevKey) ? key : 0;
+    s_prevKey = key;
+    g_overlayCapturing = om.capturing;
+    DrawUiGlossyOverlay(om, activeTab, screenW, screenH);
+    if (om.reqSave) {
+        om.reqSave = false;
+        // Nothing to show = overlay off, keeps the switch out of the page. The switch file goes
+        // first: the plugin reads it when overlay_settings.txt changes (about 2 s later).
+        static const char* kEnable = "HDD:\\X360RemapStudio\\enable_overlay.txt";
+        if (OverlayShowsAnything(s_set)) {
+            FILE* f = fopen(kEnable, "ab");
+            if (f) fclose(f);
+        } else {
+            DeleteFileA(kEnable);
+        }
+        om.savedOk = OverlaySave(kPath, s_set);
+        om.savedAt = ImGui::GetTime();
+        AppLog("Studio: overlay_settings.txt %s", om.savedOk ? "saved" : "NOT saved");
+    }
+}
+
 static void DrawGamesGlossy(int& activeTab, float screenW, float screenH) {
     if (!g_gamesBuilt) BuildGameLibrary();
     LoadProfilesOnce();
@@ -2801,6 +3116,15 @@ static void DrawGamesGlossy(int& activeTab, float screenW, float screenH) {
     }
 
     // --- actions
+    static const char* kCamPath = "HDD:\\X360RemapStudio\\camera_addresses.txt";
+    if (gm.reqDeleteCam && gm.selected >= 0) {
+        const uint32_t tid = g_games[gm.selected].tid;
+        const bool ok = CameraFileRemove(kCamPath, "HDD:\\X360RemapStudio\\camera_addresses.bak", tid);
+        AppLog(ok ? "Camera of %08X deleted" : "FAILED to delete the camera of %08X", (unsigned)tid);
+        XexUtils::Xam::XNotify(ok ? "Camera supprimee" : "ECHEC suppression de la camera");
+        gm.camState = CameraFileState(kCamPath, tid);
+    }
+    if (gm.reqSelect) gm.camState = gm.selected >= 0 ? CameraFileState(kCamPath, g_games[gm.selected].tid) : 0;
     if (gm.reqSelect && gm.selected >= 0) {
         const uint32_t tid = g_games[gm.selected].tid;
         bool found = false;
@@ -2853,6 +3177,14 @@ static void DrawGamesGlossy(int& activeTab, float screenW, float screenH) {
 
 static void DrawMappingTab() {
     LoadDevicesOnce();
+    {   // a pad plugged or unplugged can turn an old K line into a pad: rebuild the lists
+        static unsigned s_padSig = 0xFFFFFFFFu;
+        unsigned sig = 0;
+        if (g_lastSnapshot.valid && g_lastSnapshot.hasDevs)
+            for (int i = 0; i < g_lastSnapshot.devCount; i++)
+                if (g_lastSnapshot.devType[i] == 'c') sig = sig * 31u + ((unsigned)g_lastSnapshot.devVid[i] << 16 | g_lastSnapshot.devPid[i]) + 1u;
+        if (sig != s_padSig) { s_padSig = sig; RebuildDeviceIndices(); }
+    }
 
     // Actualisation AUTOMATIQUE des peripheriques (2026-09-25) : si le plugin
     // signale un appareil branche que la liste ne connait pas encore, on la
@@ -2864,9 +3196,10 @@ static void DrawMappingTab() {
         if (g_lastSnapshot.valid && g_lastSnapshot.hasDevs && nowMs - s_lastAutoRefresh > 10000) {
             bool unknown = false;
             for (int i = 0; i < g_lastSnapshot.devCount && !unknown; i++) {
-                bool found = false;
+                bool found = g_lastSnapshot.devType[i] == 'c';   // pads are not in known_devices.txt
                 for (size_t k = 0; k < g_knownDevices.size() && !found; k++)
                     found = g_knownDevices[k].vid == g_lastSnapshot.devVid[i] && g_knownDevices[k].pid == g_lastSnapshot.devPid[i];
+                    // (type check for combo receivers reverted 2026-10-30 with the auto-pick, bisect)
                 unknown = !found;
             }
             if (unknown) {
@@ -2888,6 +3221,14 @@ static void DrawMappingTab() {
     static UiMappingModel             s_model;
 
     // --- Peripheriques ---
+    // Only plugged devices (2026-11-18, HB: the Rapoo was plugged and green, yet an
+    // absent mouse stayed first and selected, after the 2026-10-30 one-shot "plugged
+    // first" pass was undone by a later rebuild of the lists). Each frame: as soon as
+    // the plugin reports one plugged keyboard (mouse), the absent ones are hidden.
+    // Nothing plugged (plugin not running, devices not replugged yet) = full list.
+    RebuildDeviceIndices();
+    KeepPluggedOnly(g_keyboardDeviceIndices, 'k', g_selectedKeyboardVid, g_selectedKeyboardPid);
+    KeepPluggedOnly(g_mouseDeviceIndices, 'm', g_selectedMouseVid, g_selectedMousePid);
     s_kb.clear(); s_kbName.clear(); s_kbId.clear();
     s_ms.clear(); s_msName.clear(); s_msId.clear();
 
@@ -2931,6 +3272,17 @@ static void DrawMappingTab() {
         s_ms.push_back(e);
     }
 
+    // The selection follows its VID:PID, never a position: the lists are rebuilt
+    // (pads, refresh), and a stored index then pointed at another device.
+    s_model.keyboardIndex = 0;
+    for (size_t i = 0; i < g_keyboardDeviceIndices.size(); i++)
+        if (g_knownDevices[g_keyboardDeviceIndices[i]].vid == g_selectedKeyboardVid &&
+            g_knownDevices[g_keyboardDeviceIndices[i]].pid == g_selectedKeyboardPid) s_model.keyboardIndex = (int)i;
+    s_model.mouseIndex = 0;
+    for (size_t i = 0; i < g_mouseDeviceIndices.size(); i++)
+        if (g_knownDevices[g_mouseDeviceIndices[i]].vid == g_selectedMouseVid &&
+            g_knownDevices[g_mouseDeviceIndices[i]].pid == g_selectedMousePid) s_model.mouseIndex = (int)i;
+
     BuildGridEntries(s_grid, s_gridLabels, s_gridKeys);
 
     // --- Remplissage du modele ---
@@ -2952,8 +3304,11 @@ static void DrawMappingTab() {
     s_model.keyboardCount = (int)s_kb.size();
     s_model.mice          = s_ms.empty() ? 0 : &s_ms[0];
     s_model.mouseCount    = (int)s_ms.size();
+    CollectPads();
+    s_model.pads          = s_padEntries;
+    s_model.padCount      = s_padCount;
     s_model.detectedCount = (int)(s_kb.size() + s_ms.size());
-    s_model.pluginAlive   = g_lastSnapshot.valid;
+    s_model.pluginAlive   = g_lastSnapshot.valid || g_pluginAliveCheck;
 
     s_model.texKeyboardSide = (ImTextureID)g_texManette;
     s_model.texKbW = g_texManetteW; s_model.texKbH = g_texManetteH;
@@ -3062,6 +3417,10 @@ static void DrawMappingTab() {
         }
     }
 
+    if (s_model.requestOpenPad >= 0) {
+        if (s_model.requestOpenPad < s_padCount) g_padView = s_model.requestOpenPad;
+        s_model.requestOpenPad = -1;
+    }
     if (s_model.requestRefreshDevices) {
         s_model.requestRefreshDevices = false;
         RefreshKnownDevices();
@@ -3078,6 +3437,7 @@ static void DrawMappingTab() {
         // le bloc de statut sur CETTE page (voir UpdateWizardModel).
         std::vector<AssistantStep> steps = DefaultKeyboardWizardSteps();
         g_wizard = new WizardSession(g_selectedKeyboardVid, g_selectedKeyboardPid, steps, 180);
+        g_capture1JustStarted = true;
         AppLog("Keyboard wizard started (%04X:%04X, %d steps)", g_selectedKeyboardVid, g_selectedKeyboardPid, (int)steps.size());
         // Le bouton "Reglages manuels" reste visible a cote de "Demarrer" -
         // par precaution, on desactive quand meme la bascule manuelle ici
@@ -3112,6 +3472,7 @@ static void DrawMappingTab() {
             oneStep.push_back(allSteps[idx]);
             g_manualSession = new WizardSession(g_selectedKeyboardVid, g_selectedKeyboardPid, oneStep, 180);
             g_manualCaptureIndex = idx;
+            g_capture2JustStarted = true;
             AppLog("Manual binding started (%04X:%04X, cell %d)", g_selectedKeyboardVid, g_selectedKeyboardPid, idx);
         }
     }
@@ -3271,6 +3632,14 @@ void __cdecl main() {
     // (peu probable ici mais inoffensif), l'appel echoue avec une collision -
     // pas traite comme une erreur bloquante.
     bool hddMounted = SUCCEEDED(XexUtils::Fs::MountHdd());
+    // Issue #8 (2026-11-18): MountHdd() is only ObCreateSymbolicLink, which succeeds
+    // even when there is no hard drive, so the USB fallback below never ran. Keep
+    // "hdd:" only if the folder really exists or can be created on it.
+    if (hddMounted && !CreateDirectoryA("HDD:\\X360RemapStudio", nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        XexUtils::Fs::UnmountPath("hdd:");
+        hddMounted = false;
+    }
 
     // --- Repli sur un autre support quand il n'y a PAS de disque dur ---
     // (2026-09-13, signale par un testeur : Slim 4 Go sans disque dur, lance
@@ -3392,7 +3761,7 @@ void __cdecl main() {
     // quelque chose s'est reellement mal passe - les etapes de succes
     // (creation reussie, boucle demarree...) n'apportent rien a l'ecran et
     // restent desormais uniquement dans le journal.
-    AppLog("App: main() started");
+    AppLog("App: main() started - X360Remap Studio %s", kAppVersion);
 
     // --- Installation fraiche : la Studio cree la configuration (2026-09-23) --
     //
@@ -3685,7 +4054,22 @@ void __cdecl main() {
         {
             static uint32_t s_lastAppliedTick = 0;
             static DWORD    s_lastValidReadMs = 0;
+            static DWORD    s_lastTickChangeMs = 0;
+            static uint32_t s_seenTick = 0;
             InputStateSnapshot fresh = ReadInputState();
+            // A file that no longer changes is NOT a live plugin (2026-10-23,
+            // HB with the plugin removed from launch.ini: "Plugin active" and a
+            // green mouse, from the input_state.json left by the last session).
+            // The plugin rewrites it ~60 times a second while the Studio runs,
+            // with a new "tick" each time: no new tick for 1.5 s = stale.
+            if (fresh.valid) {
+                if (fresh.tick != s_seenTick) { s_seenTick = fresh.tick; s_lastTickChangeMs = GetTickCount(); }
+                if (s_lastTickChangeMs == 0 || (GetTickCount() - s_lastTickChangeMs) > 1500) {
+                    static bool s_loggedStale = false;
+                    if (!s_loggedStale) { s_loggedStale = true; AppLog("input_state.json is not changing - ignored (plugin not running?)"); }
+                    fresh.valid = false;
+                }
+            }
             if (fresh.valid) {
                 const bool isNewSample = (fresh.tick != s_lastAppliedTick);
                 s_lastAppliedTick = fresh.tick;
@@ -3788,7 +4172,7 @@ void __cdecl main() {
         static DWORD s_exitArmedMs = 0;
         {
             const bool esc  = g_lastSnapshot.valid && g_lastSnapshot.keyCode == 41;   // HID 0x29
-            const bool busy = (g_wizard != nullptr) || (g_manualSession != nullptr) || overlayActive || g_gamesRenaming;
+            const bool busy = (g_wizard != nullptr) || (g_manualSession != nullptr) || overlayActive || g_gamesRenaming || g_overlayCapturing;
             if (esc && !s_prevEsc && !busy && !s_prevBusy) {
                 if (s_exitArmedMs != 0 && (GetTickCount() - s_exitArmedMs) < 2500) {
                     AppLog("App: Esc x2 - back to the dashboard");
@@ -3835,7 +4219,7 @@ void __cdecl main() {
                 // Page Soutenir glossy (2026-09-25)
                 GlossySupportModel sm;
                 sm.version     = kAppVersion;
-                sm.pluginAlive = g_lastSnapshot.valid;
+                sm.pluginAlive = g_lastSnapshot.valid || g_pluginAliveCheck;
                 sm.releasesUrl = IsLinkIntact(kReleasesUrl, kReleasesUrlHash) ? kReleasesUrl : nullptr;
                 sm.kofiUrl     = IsLinkIntact(kKofiUrl, kKofiUrlHash) ? kKofiUrl : nullptr;
                 sm.paypal      = IsLinkIntact(kPayPalEmail, kPayPalEmailHash) ? kPayPalEmail : nullptr;
@@ -3844,6 +4228,10 @@ void __cdecl main() {
                 sm.youtubeUrl  = nullptr;
                 int tab = (int)g_activeTab;
                 DrawUiGlossySupport(sm, tab, screenW, screenH);
+                g_activeTab = (AppTab)tab;
+            } else if (GlossyActive() && g_activeTab == TAB_OVERLAY) {
+                int tab = (int)g_activeTab;
+                DrawOverlayGlossy(tab, screenW, screenH);
                 g_activeTab = (AppTab)tab;
             } else if (GlossyActive() && g_activeTab == TAB_HOWTO) {
                 // Page Comment ca marche glossy (2026-09-25)
@@ -3854,6 +4242,10 @@ void __cdecl main() {
                 // Page Profils de jeux glossy (2026-09-25)
                 int tab = (int)g_activeTab;
                 DrawGamesGlossy(tab, screenW, screenH);
+                g_activeTab = (AppTab)tab;
+            } else if (GlossyActive() && g_activeTab == TAB_MAPPING && g_padView >= 0) {
+                int tab = (int)g_activeTab;
+                DrawPadGlossy(tab, screenW, screenH);
                 g_activeTab = (AppTab)tab;
             } else if (GlossyActive() && g_activeTab == TAB_MAPPING) {
                 // Page glossy : plein ecran, sa propre barre d'onglets. Elle
@@ -3883,6 +4275,7 @@ void __cdecl main() {
             switch (g_activeTab) {
                 case TAB_MAPPING:  DrawMappingTab();     break;
                 case TAB_PROFILES: DrawProfilesTab();    break;
+                case TAB_OVERLAY:  break;   // glossy page only
                 case TAB_HOWTO:    DrawHowItWorksTab();  break;
                 case TAB_SUPPORT:  DrawSupportTab();     break;
             }
@@ -3894,6 +4287,63 @@ void __cdecl main() {
         if (s_exitArmedMs != 0 && GlossyActive()) {
             const float k = (float)(GetTickCount() - s_exitArmedMs) / 2500.0f;
             DrawUiGlossyToast(Tr(STR_EXIT_CONFIRM), k < 0.8f ? 1.0f : (1.0f - k) * 5.0f, screenW, screenH);
+        }
+
+        // Plugin not running (2026-10-20, idea HB): a news-style band at the
+        // bottom says so, with the cause read from launch.ini (plugin_diag.h).
+        // "Alive" = the plugin log keeps growing (it writes a heartbeat every
+        // second) or input reaches the Studio. Checked every 5 s; the band
+        // only shows after two checks with no sign of life.
+        if (GlossyActive()) {
+            static DWORD s_start = GetTickCount();
+            static DWORD s_lastCheck = 0;
+            static DWORD s_lastSize = 0xFFFFFFFF;
+            static FILETIME s_lastWrite = { 0, 0 };
+            static int s_deadChecks = 0;
+            static std::string s_ticker;
+            const DWORD now = GetTickCount();
+            if (now - s_lastCheck >= 5000) {
+                s_lastCheck = now;
+                bool alive = g_lastSnapshot.valid;
+                WIN32_FILE_ATTRIBUTE_DATA fa;
+                if (GetFileAttributesExA("HDD:\\X360RemapStudio\\X360Remap_plugin.log", GetFileExInfoStandard, &fa)) {
+                    const bool changed = fa.nFileSizeLow != s_lastSize ||
+                        fa.ftLastWriteTime.dwLowDateTime != s_lastWrite.dwLowDateTime ||
+                        fa.ftLastWriteTime.dwHighDateTime != s_lastWrite.dwHighDateTime;
+                    if (changed && s_lastSize != 0xFFFFFFFF) alive = true;
+                    s_lastSize = fa.nFileSizeLow;
+                    s_lastWrite = fa.ftLastWriteTime;
+                }
+                s_deadChecks = alive ? 0 : s_deadChecks + 1;
+                g_pluginAliveCheck = alive;
+                if (alive) {
+                    if (!s_ticker.empty()) AppLog("Plugin signs of life again - band hidden");
+                    s_ticker.clear();
+                } else if (s_deadChecks >= 2 && s_ticker.empty()) {
+                    std::string ini;
+                    bool haveIni = false;
+                    const char* inis[] = { "HDD:\\launch.ini", "HDD:\\DashLaunch\\launch.ini" };
+                    for (size_t i = 0; i < 2 && !haveIni; i++) {
+                        std::vector<unsigned char> raw;
+                        if (ReadWholeFile(inis[i], raw) && !raw.empty()) { ini.assign(raw.begin(), raw.end()); haveIni = true; }
+                    }
+                    const PluginDiagResult r = DiagnoseLaunchIni(haveIni ? &ini : nullptr, PdFileExists);
+                    char buf[768];
+                    switch (r.diag) {
+                    case DIAG_NO_INI:       _snprintf(buf, sizeof(buf) - 1, "%s", Tr(STR_DIAG_NO_INI)); break;
+                    case DIAG_NO_LINE:      _snprintf(buf, sizeof(buf) - 1, "%s", Tr(STR_DIAG_NO_LINE)); break;
+                    case DIAG_FILE_MISSING: _snprintf(buf, sizeof(buf) - 1, Tr(STR_DIAG_FILE_MISSING_FMT), r.pluginPath.c_str()); break;
+                    case DIAG_HIDDRIVER:    _snprintf(buf, sizeof(buf) - 1, Tr(STR_DIAG_HIDDRIVER_FMT), r.otherPath.c_str()); break;
+                    default:                _snprintf(buf, sizeof(buf) - 1, Tr(STR_DIAG_LINE_OK_FMT), r.pluginPath.c_str()); break;
+                    }
+                    buf[sizeof(buf) - 1] = 0;
+                    s_ticker = buf;
+                    AppLog("Plugin not running - diagnosis %d, plugin line '%s', hiddriver line '%s'",
+                           (int)r.diag, r.pluginPath.c_str(), r.otherPath.c_str());
+                }
+            }
+            if (!s_ticker.empty())
+                DrawUiGlossyTicker(Tr(STR_DIAG_LABEL), s_ticker.c_str(), (float)(now - s_start) / 1000.0f, screenW, screenH);
         }
 
         // Ecran de demarrage anime (2026-09-26, idee HB), par-dessus la page :

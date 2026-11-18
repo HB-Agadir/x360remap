@@ -30,6 +30,26 @@ struct HidButtonMapEntry {
     uint8_t ButtonsReport::* field;
 };
 
+// Macro ("macros" in X360Remap.json, CONTRACT.md): one pad button plays a list of
+// steps, like a fighting-game combo (HB, 2026-11-05). A step holds some Xbox buttons
+// (bit i = kButtonFieldNames[i], see MacroFieldBit) for ms milliseconds; ms 0 = as
+// long as the pad button stays held. The old form, one held combo, is one ms 0 step.
+#define MAX_MACRO_STEPS 64
+#define MAX_MACROS 16
+struct HidMacroStep { uint32_t mask; uint16_t ms; };
+struct HidButtonMacro {
+    uint8_t idx;
+    uint8_t stepCount;
+    HidMacroStep steps[MAX_MACRO_STEPS];
+};
+// Playback of one macro on one pad, advanced at each game read.
+struct MacroPlay { uint8_t step; bool playing, wasHeld, delivered; uint32_t stepStart; };
+uint32_t MacroFieldBit(uint8_t ButtonsReport::* field);   // 0 if not a button field
+void ApplyMacroMask(ButtonsReport* out, uint32_t mask);
+// Buttons to press now. A press starts the whole list once; presses while it plays
+// are ignored. Every step reaches at least one game read, even a short one.
+uint32_t MacroAdvance(const HidButtonMacro& m, MacroPlay& p, uint32_t now, bool held);
+
 // What a keyboard key does once pressed. Deliberately an enum rather than a
 // ButtonsReport member pointer (like HidButtonMapEntry uses), because a key can
 // also drive a stick DIRECTION, which is not a single field: "left stick up"
@@ -262,11 +282,36 @@ struct HidDeviceMapping {
     // d'un retard d'environ N/2 ms. Meme role que le "Smoothing" de XIM et le
     // "Smoothness" de Cronus.
     int32_t smoothingMs;
+
+    // DIRECT AIM (2026-10-13, tester on MW2 TU9: "ADS is like x5 the hip
+    // sensitivity"). When the game camera is moved directly, zooming in
+    // (aim down sights) does not slow the mouse down like it does on PC.
+    //   adsSensitivity: % of the normal speed while LT (aim) is held,
+    //                   0 = 100 % (no change). Example: 25.
+    //   directAimSmoothingMs: smoothing of the direct aim movement, in ms
+    //                   (0 = off), same method as smoothingMs.
+    int32_t adsSensitivity;
+    int32_t directAimSmoothingMs;
+    //   adsRampMs: how long the change to/from adsSensitivity takes, in ms
+    //              (0 = instant). Follows the aim-down-sights animation
+    //              instead of "sticking" the moment the button is pressed.
+    int32_t adsRampMs;
+
+    // Macros (2026-11-03, see HidButtonMacro). Added last, same reason as reportLayout.
+    const HidButtonMacro* macros;
+    uint8_t macroCount;
+
+    // GIMX mouse method (1.4.2, docs/PLAN_1.4.2_GIMX.md): "gimx" object of the device in
+    // X360Remap.json. gimxOn = false keeps the old path. Added last, same reason.
+    bool  gimxOn;
+    float gimxDeadZone, gimxMultX, gimxMultY, gimxExponent, gimxFilter;
+    int32_t gimxBuffer;
 };
 
 struct DynamicMappingData {
     std::vector<HidAxisMapEntry> axisEntries;
     std::vector<HidButtonMapEntry> buttonEntries;
+    std::vector<HidButtonMacro> macroEntries;
     std::vector<HidKeyMapEntry> keyEntries;
     std::vector<HidDeviceProfile> profileEntries;
 
@@ -307,7 +352,35 @@ struct EffectiveMouseSettings {
     int32_t antiDeadzone;            // 0 = desactivee (voir HidDeviceMapping::antiDeadzone)
     int32_t antiDeadzoneY;           // RESOLU : jamais 0 si antiDeadzone > 0 et Y non regle
     int32_t smoothingMs;             // 0 = pas de lissage
+    int32_t adsSensitivity;          // direct aim while LT is held, % (0 = 100)
+    int32_t directAimSmoothingMs;    // direct aim smoothing, ms (0 = off)
+    int32_t adsRampMs;               // ADS transition time, ms (0 = instant)
+    // GIMX method (device level, 1.4.2): see GimxMouseToStick.
+    bool  gimxOn;
+    float gimxDeadZone, gimxMultX, gimxMultY, gimxExponent, gimxFilter;
+    int32_t gimxBuffer;
 };
+
+// ---------------------------------------------------------------------------
+// GIMX mouse to stick (1.4.2). Same math as GIMX core/config.c (matlo/GIMX, GPL-3):
+// motion = weighted mean of the last `buffer` samples (weights 1, f, f^2...) plus the
+// residue; z = multiplier * |v|^exponent; stick = dead zone + z (aiming mode), clamped;
+// the motion not turned into stick (clamp, integer rounding) is carried to the next
+// poll and dropped when the mouse stops. Units are GIMX's, so its X360 configs work
+// as they are: dead zone and multiplier in 8-bit steps (x 257 on the 16-bit stick),
+// motion in mouse counts per 10 ms (GIMX DEFAULT_REFRESH_PERIOD).
+// ---------------------------------------------------------------------------
+#define GIMX_MAX_BUFFER 16
+struct GimxState {
+    float histX[GIMX_MAX_BUFFER], histY[GIMX_MAX_BUFFER];
+    int   idx;
+    float resX, resY;
+};
+void GimxReset(GimxState* s);
+// dx, dy: mouse counts since the last poll (dy > 0 = stick up, the caller flips the mouse),
+// dtMs: time since the last poll. Writes the right stick, -32767..32767.
+void GimxMouseToStick(const EffectiveMouseSettings& e, GimxState* s, int32_t dx, int32_t dy, uint32_t dtMs,
+                      int32_t* stickX, int32_t* stickY);
 
 // nullptr si aucun profil de `map` ne correspond a `titleId`, si `map` est
 // nul, ou si `titleId` vaut 0 (XamGetCurrentTitleId() renvoie 0 hors d'un
@@ -362,12 +435,39 @@ const HidKeyMapEntry* ResolveEffectiveKeyMap(const HidDeviceMapping* map, uint32
 // le commentaire detaille dans mapping.cpp). Renvoient le nombre d'entrees
 // ecrites dans `out`. Tampon fourni par l'appelant : ces fonctions tournent
 // dans le contexte USB, aucune allocation n'y est admissible.
-#define MAX_MERGED_BUTTONS 16
+// 24 (was 16, 2026-10-14): a controller with a D-pad on buttons has 17
+// outputs (DualShock 3 included) - the 17th, D-pad down, was cut off.
+#define MAX_MERGED_BUTTONS 24
 #define MAX_MERGED_KEYS    96
 uint8_t ResolveMergedButtonMap(const HidDeviceMapping* map, uint32_t titleId,
                                 HidButtonMapEntry* out, uint8_t outCapacity);
+// The default keyboard layout (same keys as the hard-coded defaults the
+// plugin always had: WASD, IJKL, Space/C/R/E, Q/F, Esc/Tab, Shift/Ctrl/Alt,
+// V, right Alt, arrows). Returns the number of entries written.
+uint8_t GetDefaultKeyMap(HidKeyMapEntry* out, uint8_t outCapacity);
+
+// What the keyboard really does (2026-10-11, tester with a Razer Tartarus:
+// assigning ONE key in the Studio made the whole keypad dead). The default
+// layout first, then the device's own keys on top (a custom entry replaces the
+// default entry for the same controller action AND frees its key), then the
+// active game profile (quick bind) on top of that. A full layout from the
+// 21-step wizard simply replaces every default.
+uint8_t ResolveEffectiveKeyMap(const HidDeviceMapping* map, uint32_t titleId,
+                               HidKeyMapEntry* out, uint8_t outCapacity);
+
 uint8_t ResolveMergedKeyMap(const HidDeviceMapping* map, uint32_t titleId,
                              HidKeyMapEntry* out, uint8_t outCapacity);
+
+// Gaming keypads (2026-10-11). A keypad has no Esc, no right Alt, no V...
+// so START, Guide and R3 would be unreachable with the keyboard defaults.
+// Factory layout from OpenTartarus (MIT): 01-05 = 1-5, 06 Tab, 07 Q, 08 W,
+// 09 E, 10 R, 11 CapsLock, 12 A, 13 S, 14 D, 15 F, 16 LShift, 17 Z, 18 X,
+// 19 C, 20 Space, round thumb button = LAlt, thumbpad = arrows.
+bool IsKnownKeypad(uint16_t vendorId, uint16_t productId);
+// Adds the keypad's preset keys that are not already used in out[]
+// (anything the player assigned wins). Returns the new count.
+uint8_t AddKeypadPreset(uint16_t vendorId, uint16_t productId,
+                        HidKeyMapEntry* out, uint8_t count, uint8_t outCapacity);
 
 // Cree/met a jour UNE SEULE entree du buttonMap ou keyMap du profil `titleId`
 // du device vid/pid, sans toucher aux autres entrees ni aux reglages
@@ -452,6 +552,11 @@ void SmoothMouseDelta(SmoothingState* st, uint32_t nowMs, int32_t* dx, int32_t* 
 
 HidDeviceMapping* FindMapping(uint16_t vid, uint16_t pid);
 
+// Last lookup of FindMapping, after X360Remap.json and the built-in mappings.
+// The plugin points it at FindKnownControllerMapping (known_controllers.h);
+// nullptr in the Studio and the tests, so they need no extra file.
+extern HidDeviceMapping* (*g_extraMappingLookup)(uint16_t vid, uint16_t pid);
+
 bool LoadMappingsFromJson(const std::string& jsonString);
 bool LoadMappingsFromFile(const std::string& filepath);
 std::string SaveMappingsToJson();
@@ -489,3 +594,10 @@ bool LoadMappingsForUpdate(const std::string& filepath);
 // X360Remap/main.cpp. Cout : une copie de la configuration en memoire, soit
 // quelques kilo-octets.
 void ClearDynamicMappings();
+
+// True when map lives in the tables read from X360Remap.json.
+bool IsDynamicMapping(const HidDeviceMapping* map);
+// Adds a copy of a built-in pad mapping (axes, buttons, inversion, deadzone) to
+// those tables, so it is saved to X360Remap.json. Moves the table: detach the
+// controllers' map pointers first, rebind them after.
+void AddDynamicCopy(const HidDeviceMapping& src);

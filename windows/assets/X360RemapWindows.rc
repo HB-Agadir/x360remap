@@ -1,0 +1,30 @@
+// Icon 1: loaded by win_main.cpp for the window and shown by Explorer for the exe.
+1 ICON "X360RemapWindows.ico"
+
+// File details shown by Explorer (and read by antivirus engines: an exe
+// without them scores as suspicious). Keep in step with kWinAppVersion.
+1 VERSIONINFO
+FILEVERSION 1,3,0,18
+PRODUCTVERSION 1,3,0,18
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "X360Remap (HB-Agadir)"
+            VALUE "FileDescription", "X360Remap Studio for Windows - settings editor for the X360Remap Xbox 360 plugin"
+            VALUE "FileVersion", "1.3-pre18"
+            VALUE "InternalName", "X360RemapStudio"
+            VALUE "LegalCopyright", "X360Remap project, github.com/HB-Agadir/X360Remap"
+            VALUE "OriginalFilename", "X360RemapStudio.exe"
+            VALUE "ProductName", "X360Remap Studio"
+            VALUE "ProductVersion", "1.3-pre18"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

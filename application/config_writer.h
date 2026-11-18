@@ -115,6 +115,37 @@ bool RestoreConfigDefault(const char* configPath, const char* backupPath);
 // n'a ete sauvegarde.
 bool HasConfigDefault();
 
+// USB controller page (2026-11-03). One cell per Xbox output of the Studio grid
+// (A B X Y LB RB LT RT L3 R3 START BACK GUIDE D-up D-down D-left D-right), each
+// bound to a pad button idx (HID button usage - 1) in the device's "buttons".
+// Only an EXISTING entry that already has axes is edited: an entry without
+// axes would leave the sticks dead (axisMapCount 0), so ApplyPad* return false
+// for a pad the plugin has not written yet (hasEntry/hasAxes tell the page).
+#ifndef PAD_CELLS
+#define PAD_CELLS 17
+#endif
+extern const char* const kPadFieldNames[PAD_CELLS];
+#define PAD_MACROS_MAX_CFG 16   // MAX_MACROS of mapping.h
+#define PAD_STEPS_MAX_CFG 64    // MAX_MACRO_STEPS of mapping.h
+// One step of a macro: the cells held (bit i = cell i of kPadFieldNames) for ms
+// milliseconds (16..5000), 0 = as long as the trigger stays held; mask 0 = pause.
+struct PadStep { unsigned mask; int ms; };
+struct PadMacro { int btn; int stepCount; PadStep steps[PAD_STEPS_MAX_CFG]; };   // btn = trigger idx
+struct PadConfig {
+    bool hasEntry, hasAxes;
+    int  btnIdx[PAD_CELLS];   // -1 = no button
+    bool invertRY;            // right stick Y inverted
+    int  deadzone;            // "deadzone" field of the entry
+    PadMacro macros[PAD_MACROS_MAX_CFG]; int macroCount;
+};
+bool ReadPadConfig(uint16_t vid, uint16_t pid, PadConfig& out);
+bool ReadPadConfig(uint16_t vid, uint16_t pid, PadConfig& out, const char* configPath);
+// Macro idx are removed from "buttons" here (the plugin does not do it).
+bool ApplyPadButtons(uint16_t vid, uint16_t pid, const int btnIdx[PAD_CELLS], const PadMacro* macros, int macroCount);
+bool ApplyPadButtons(uint16_t vid, uint16_t pid, const int btnIdx[PAD_CELLS], const PadMacro* macros, int macroCount, const char* configPath);
+bool ApplyPadStick(uint16_t vid, uint16_t pid, bool invertRY, int deadzone);
+bool ApplyPadStick(uint16_t vid, uint16_t pid, bool invertRY, int deadzone, const char* configPath);
+
 // Reglages d'ORIGINE (2026-09-25) : configuration vide "[]", exactement
 // l'etat d'une installation neuve - le plugin applique alors ses commandes
 // FPS integrees (WASD, Espace = A...). La configuration actuelle est d'abord
@@ -230,7 +261,8 @@ std::vector<uint32_t> ListKnownTitleIds(const char* path);
 struct KnownDeviceInfo {
     uint16_t vid;
     uint16_t pid;
-    bool isMouse; // false = clavier
+    bool isMouse; // false = clavier (ou manette : tester isPad d'abord)
+    bool isPad;   // type C du fichier : manette USB
     // Nom declare par le peripherique (descripteur de chaine USB), recupere
     // par le plugin. Chaine vide s'il n'en declare pas ou si le fichier a ete
     // ecrit par une version anterieure : l'affichage retombe sur le VID:PID.

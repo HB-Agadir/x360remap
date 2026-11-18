@@ -1158,7 +1158,35 @@ static void TestAxisAntiDeadzoneAndSmoothing() {
     CHECK(dx >= 6 && dx <= 8 && dy >= -4 && dy <= -2);
 }
 
+// 2026-10-11, Razer Tartarus tester: one key assigned in the Studio made the
+// whole keypad dead. Custom keys now go on top of the default layout.
+static void TestEffectiveKeyMapKeepsDefaults() {
+    std::printf("TestEffectiveKeyMapKeepsDefaults\n");
+    HidKeyMapEntry one[1] = { { 0x1A, KEYACT_Y } };     // W -> Y
+    HidDeviceMapping map;
+    std::memset(&map, 0, sizeof(map));
+    map.keyMap = one; map.keyMapCount = 1;
+    HidKeyMapEntry out[MAX_MERGED_KEYS];
+    uint8_t n = ResolveEffectiveKeyMap(&map, 0, out, MAX_MERGED_KEYS);
+    bool wToY = false, wToUp = false, eToY = false, aToLeft = false, spaceToA = false;
+    for (uint8_t i = 0; i < n; i++) {
+        if (out[i].code == 0x1A && out[i].action == KEYACT_Y) wToY = true;
+        if (out[i].code == 0x1A && out[i].action == KEYACT_LSTICK_UP) wToUp = true;
+        if (out[i].code == 0x08 && out[i].action == KEYACT_Y) eToY = true;
+        if (out[i].code == 0x04 && out[i].action == KEYACT_LSTICK_LEFT) aToLeft = true;
+        if (out[i].code == 0x2C && out[i].action == KEYACT_A) spaceToA = true;
+    }
+    CHECK(wToY);        // the new assignment
+    CHECK(!wToUp);      // W no longer moves forward
+    CHECK(!eToY);       // Y is not on two keys
+    CHECK(aToLeft);     // the rest of the default layout is still there
+    CHECK(spaceToA);
+    HidKeyMapEntry defs[64];
+    CHECK(GetDefaultKeyMap(defs, 64) == 25);
+}
+
 int main() {
+    TestEffectiveKeyMapKeepsDefaults();
     TestNormalSequence();
     TestHoldToSkip();
     TestConflictDetection();
